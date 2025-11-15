@@ -46,7 +46,8 @@ RUN curl -L "https://github.com/phracker/MacOSX-SDKs/releases/download/11.3/MacO
 ENV SDKROOT=/opt/MacOSX11.3.sdk
 
 # Install Rust targets
-RUN rustup target add \
+RUN rustup default beta \
+    && rustup target add \
     x86_64-unknown-linux-gnu \
     x86_64-unknown-linux-musl \
     aarch64-unknown-linux-gnu \
@@ -58,7 +59,14 @@ RUN rustup target add \
     x86_64-apple-darwin \
     aarch64-apple-darwin \
     x86_64-pc-windows-gnu \
-    aarch64-pc-windows-gnullvm
+    aarch64-pc-windows-gnullvm \
+    && rustup component add rustfmt
 
 RUN --mount=type=bind,from=builder,source=/,target=/mnt/ \
     cp /mnt/cargo-zigbuild/target/$(cat /mnt/tmp/rust-target-triple)/release/cargo-zigbuild /usr/local/cargo/bin/
+
+RUN apt-get update && \
+    apt-get install -y \
+    cmake \
+    clang \
+    && apt-get clean
