@@ -20,6 +20,10 @@ ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
 
 RUN rustup target add $(cat /tmp/rust-target-triple)
 
+RUN curl -fsSL https://github.com/rust-lang/rust-bindgen/archive/refs/tags/v0.72.1.tar.gz | tar -xz -f- && \
+    cd /rust-bindgen-0.72.1 && \
+    cargo zigbuild --bin=bindgen --target=$(cat /tmp/rust-target-triple) --release
+
 # Compile dependencies only for build caching
 ADD Cargo.toml /cargo-zigbuild/Cargo.toml
 ADD Cargo.lock /cargo-zigbuild/Cargo.lock
@@ -28,10 +32,18 @@ RUN mkdir /cargo-zigbuild/src && \
     cargo zigbuild --target=$(cat /tmp/rust-target-triple) --manifest-path /cargo-zigbuild/Cargo.toml --release
 
 # Build cargo-zigbuild
-ADD . /cargo-zigbuild/
+ADD src /cargo-zigbuild/src
 # Manually update the timestamps as ADD keeps the local timestamps and cargo would then believe the cache is fresh
 RUN touch /cargo-zigbuild/src/lib.rs /cargo-zigbuild/src/bin/cargo-zigbuild.rs
 RUN cargo zigbuild --target=$(cat /tmp/rust-target-triple) --manifest-path /cargo-zigbuild/Cargo.toml --release
+
+FROM debian:trixie AS musl-cross-make
+
+ADD musl-cross-make /musl-cross-make
+
+WORKDIR /musl-cross-make
+
+RUN ./make-arch.sh aarch64 riscv64 x86_64
 
 FROM rust:$RUST_VERSION-trixie
 
@@ -64,9 +76,17 @@ RUN rustup default beta \
 
 RUN --mount=type=bind,from=builder,source=/,target=/mnt/ \
     cp /mnt/cargo-zigbuild/target/$(cat /mnt/tmp/rust-target-triple)/release/cargo-zigbuild /usr/local/cargo/bin/
+RUN --mount=type=bind,from=builder,source=/,target=/mnt/ \
+    cp /mnt/rust-bindgen-0.72.1/target/$(cat /mnt/tmp/rust-target-triple)/release/bindgen /usr/local/cargo/bin/
 
 RUN apt-get update && \
     apt-get install -y \
     cmake \
     clang \
+    libclang-dev \
+    lld \
+    rsync \
     && apt-get clean
+
+COPY --from=musl-cross-make /musl-cross-make/output /opt/musl-cross-make
+COPY --from=musl-cross-make /musl-cross-make/cmake /root/cmake-overrides
