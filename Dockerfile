@@ -39,6 +39,8 @@ RUN cargo zigbuild --target=$(cat /tmp/rust-target-triple) --manifest-path /carg
 
 FROM debian:trixie AS musl-cross-make
 
+RUN apt-get update && apt-get install -y wget build-essential rsync texinfo file
+
 ADD musl-cross-make /musl-cross-make
 
 WORKDIR /musl-cross-make
