@@ -18,6 +18,52 @@ use target_lexicon::{Architecture, Environment, OperatingSystem, Triple};
 use crate::linux::ARM_FEATURES_H;
 use crate::macos::{LIBCHARSET_TBD, LIBICONV_TBD};
 
+/// Check if we should use clang instead of zig for macOS targets.
+/// This is needed because Zig 0.14+ has a bug where --sysroot is prepended
+/// to all -L paths, breaking build script outputs.
+/// See https://github.com/ziglang/zig/issues/24368
+fn should_use_clang_for_macos() -> bool {
+    // Check if CARGO_ZIGBUILD_USE_CLANG is set to force clang usage
+    if let Ok(val) = env::var("CARGO_ZIGBUILD_USE_CLANG") {
+        return val == "1" || val.to_lowercase() == "true";
+    }
+    // Auto-detect: use clang for Zig 0.14+ when SDKROOT is set
+    if env::var_os("SDKROOT").is_some() {
+        if let Ok(version) = Zig::zig_version() {
+            return (version.major, version.minor) >= (0, 14);
+        }
+    }
+    false
+}
+
+/// Find clang binary path
+fn find_clang() -> Result<PathBuf> {
+    let clang = env::var("CARGO_ZIGBUILD_CLANG_PATH").unwrap_or_else(|_| "clang".to_string());
+    which::which(&clang).with_context(|| format!("Failed to find clang at '{clang}'. Set CARGO_ZIGBUILD_CLANG_PATH to specify the path."))
+}
+
+/// Find clang++ binary path
+fn find_clangxx() -> Result<PathBuf> {
+    let clangxx = env::var("CARGO_ZIGBUILD_CLANGXX_PATH").unwrap_or_else(|_| "clang++".to_string());
+    which::which(&clangxx).with_context(|| format!("Failed to find clang++ at '{clangxx}'. Set CARGO_ZIGBUILD_CLANGXX_PATH to specify the path."))
+}
+
+/// Find ar binary path (llvm-ar or system ar)
+fn find_ar() -> Result<PathBuf> {
+    let ar = env::var("CARGO_ZIGBUILD_AR_PATH").unwrap_or_else(|_| "llvm-ar".to_string());
+    which::which(&ar)
+        .or_else(|_| which::which("ar"))
+        .with_context(|| "Failed to find ar or llvm-ar. Set CARGO_ZIGBUILD_AR_PATH to specify the path.".to_string())
+}
+
+/// Find ranlib binary path (llvm-ranlib or system ranlib)
+fn find_ranlib() -> Result<PathBuf> {
+    let ranlib = env::var("CARGO_ZIGBUILD_RANLIB_PATH").unwrap_or_else(|_| "llvm-ranlib".to_string());
+    which::which(&ranlib)
+        .or_else(|_| which::which("ranlib"))
+        .with_context(|| "Failed to find ranlib or llvm-ranlib. Set CARGO_ZIGBUILD_RANLIB_PATH to specify the path.".to_string())
+}
+
 /// Zig linker wrapper
 #[derive(Clone, Debug, clap::Subcommand)]
 pub enum Zig {
@@ -1173,7 +1219,22 @@ impl TargetFlags {
 /// if the linker target changed
 #[allow(clippy::blocks_in_conditions)]
 pub fn prepare_zig_linker(target: &str) -> Result<ZigWrapper> {
-    let (rust_target, abi_suffix) = target.split_once('.').unwrap_or((target, ""));
+    let (rust_target, _) = target.split_once('.').unwrap_or((target, ""));
+    let triple: Triple = rust_target
+        .parse()
+        .with_context(|| format!("Unsupported Rust target '{rust_target}'"))?;
+
+    // For macOS targets, check if we should use clang instead of zig
+    // This works around Zig 0.14+ bug with --sysroot prepending to -L paths
+    if matches!(
+        triple.operating_system,
+        OperatingSystem::MacOSX { .. } | OperatingSystem::Darwin(_)
+    ) && should_use_clang_for_macos()
+    {
+        return prepare_clang_linker(target);
+    }
+
+    let (_, abi_suffix) = target.split_once('.').unwrap_or((target, ""));
     let abi_suffix = if abi_suffix.is_empty() {
         String::new()
     } else {
@@ -1552,6 +1613,130 @@ fn python_path() -> Result<PathBuf> {
 fn zig_path() -> Result<PathBuf> {
     let zig = env::var("CARGO_ZIGBUILD_ZIG_PATH").unwrap_or_else(|_| "zig".to_string());
     Ok(which::which(zig)?)
+}
+
+/// Prepare clang-based linker wrapper for macOS cross-compilation.
+/// This is used as a fallback when Zig 0.14+ has issues with --sysroot.
+pub fn prepare_clang_linker(target: &str) -> Result<ZigWrapper> {
+    let (rust_target, abi_suffix) = target.split_once('.').unwrap_or((target, ""));
+    let triple: Triple = rust_target
+        .parse()
+        .with_context(|| format!("Unsupported Rust target '{rust_target}'"))?;
+    let arch = triple.architecture.to_string();
+
+    let sdkroot = Zig::macos_sdk_root()
+        .ok_or_else(|| anyhow!("SDKROOT must be set for clang-based macOS cross-compilation"))?;
+
+    let file_ext = if cfg!(windows) { "bat" } else { "sh" };
+    let file_target = target.trim_end_matches('.');
+
+    // Build clang arguments for macOS cross-compilation
+    let mut cc_args = vec![
+        format!("--target={}-apple-darwin", arch),
+        format!("--sysroot={}", sdkroot.display()),
+        format!("-isysroot {}", sdkroot.display()),
+        "-g".to_owned(),
+        "-fno-sanitize=all".to_owned(),
+        format!("-F{}", sdkroot.join("System").join("Library").join("Frameworks").display()),
+        "-DTARGET_OS_IPHONE=0".to_owned(),
+    ];
+
+    // Add minimum macOS version if specified in abi_suffix
+    if !abi_suffix.is_empty() {
+        cc_args.push(format!("-mmacosx-version-min={}", &abi_suffix[1..]));
+    } else {
+        // Default to macOS 11.0 for arm64, 10.12 for x86_64
+        let min_version = if arch == "aarch64" { "11.0" } else { "10.12" };
+        cc_args.push(format!("-mmacosx-version-min={}", min_version));
+    }
+
+    // Use lld as the linker if available, otherwise rely on system linker
+    if which::which("ld64.lld").is_ok() || which::which("lld").is_ok() {
+        cc_args.push("-fuse-ld=lld".to_owned());
+    }
+
+    let clang_path = find_clang()?;
+    let clangxx_path = find_clangxx()?;
+
+    let linker_dir = cache_dir();
+    fs::create_dir_all(&linker_dir)?;
+
+    let cc_args_str = cc_args.join(" ");
+    let hash = crc::Crc::<u16>::new(&crc::CRC_16_IBM_SDLC).checksum(cc_args_str.as_bytes());
+
+    let clang_cc = linker_dir.join(format!("clangcc-{file_target}-{:x}.{file_ext}", hash));
+    let clang_cxx = linker_dir.join(format!("clangcxx-{file_target}-{:x}.{file_ext}", hash));
+    let clang_ranlib = linker_dir.join(format!("clangranlib.{file_ext}"));
+
+    write_clang_wrapper(&clang_cc, &clang_path, &cc_args_str)?;
+    write_clang_wrapper(&clang_cxx, &clangxx_path, &cc_args_str)?;
+
+    let ranlib_path = find_ranlib()?;
+    write_clang_wrapper(&clang_ranlib, &ranlib_path, "")?;
+
+    let ar_path = find_ar()?;
+    let clang_ar = linker_dir.join(format!("clangar-{file_target}.{file_ext}"));
+    write_clang_wrapper(&clang_ar, &ar_path, "")?;
+
+    // For lib (used on MSVC targets), just use ar
+    let clang_lib = linker_dir.join(format!("clanglib-{file_target}.{file_ext}"));
+    write_clang_wrapper(&clang_lib, &ar_path, "")?;
+
+    Ok(ZigWrapper {
+        cc: clang_cc,
+        cxx: clang_cxx,
+        ar: clang_ar,
+        ranlib: clang_ranlib,
+        lib: clang_lib,
+    })
+}
+
+/// Write a clang wrapper script for unix
+#[cfg(target_family = "unix")]
+fn write_clang_wrapper(path: &Path, compiler: &Path, args: &str) -> Result<()> {
+    let mut buf = Vec::<u8>::new();
+    writeln!(&mut buf, "#!/bin/sh")?;
+    writeln!(
+        &mut buf,
+        "exec \"{}\" {} \"$@\"",
+        compiler.display(),
+        args
+    )?;
+
+    let existing_content = fs::read(path).unwrap_or_default();
+    if existing_content != buf {
+        OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o700)
+            .open(path)?
+            .write_all(&buf)?;
+    }
+    Ok(())
+}
+
+/// Write a clang wrapper script for windows
+#[cfg(not(target_family = "unix"))]
+fn write_clang_wrapper(path: &Path, compiler: &Path, args: &str) -> Result<()> {
+    let mut buf = Vec::<u8>::new();
+    let compiler_str = if is_mingw_shell() {
+        compiler.to_slash_lossy().to_string()
+    } else {
+        compiler.display().to_string()
+    };
+    writeln!(
+        &mut buf,
+        "\"{}\" {} %*",
+        adjust_canonicalization(compiler_str),
+        args
+    )?;
+
+    let existing_content = fs::read(path).unwrap_or_default();
+    if existing_content != buf {
+        fs::write(path, buf)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
