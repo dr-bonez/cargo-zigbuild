@@ -400,25 +400,25 @@ impl Zig {
         zig_version: &semver::Version,
     ) -> Result<()> {
         let sdkroot = Self::macos_sdk_root();
-        if (zig_version.major, zig_version.minor) >= (0, 12) {
-            // Zig 0.12.0+ requires passing `--sysroot`
+        if (zig_version.major, zig_version.minor) >= (0, 12)
+            && (zig_version.major, zig_version.minor) < (0, 14)
+        {
+            // Zig 0.12-0.13 requires passing `--sysroot`
+            // Zig 0.14+ has a bug where --sysroot is prepended to all -L paths,
+            // breaking build script outputs. Don't use --sysroot for 0.14+.
+            // See https://github.com/ziglang/zig/issues/24368
             if let Some(ref sdkroot) = sdkroot {
                 new_cmd_args.push(format!("--sysroot={}", sdkroot.display()));
             }
         }
         if let Some(ref sdkroot) = sdkroot {
-            let include_prefix = if (zig_version.major, zig_version.minor) < (0, 14) {
-                sdkroot
-            } else {
-                Path::new("/")
-            };
             new_cmd_args.extend_from_slice(&[
                 "-isystem".to_string(),
-                format!("{}", include_prefix.join("usr").join("include").display()),
-                format!("-L{}", include_prefix.join("usr").join("lib").display()),
+                format!("{}", sdkroot.join("usr").join("include").display()),
+                format!("-L{}", sdkroot.join("usr").join("lib").display()),
                 format!(
                     "-F{}",
-                    include_prefix
+                    sdkroot
                         .join("System")
                         .join("Library")
                         .join("Frameworks")

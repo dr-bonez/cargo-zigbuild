@@ -76,11 +76,6 @@ RUN rustup default beta \
     aarch64-pc-windows-gnullvm \
     && rustup component add rustfmt
 
-RUN --mount=type=bind,from=builder,source=/,target=/mnt/ \
-    cp /mnt/cargo-zigbuild/target/$(cat /mnt/tmp/rust-target-triple)/release/cargo-zigbuild /usr/local/cargo/bin/
-RUN --mount=type=bind,from=builder,source=/,target=/mnt/ \
-    cp /mnt/rust-bindgen-0.72.1/target/$(cat /mnt/tmp/rust-target-triple)/release/bindgen /usr/local/cargo/bin/
-
 RUN apt-get update && \
     apt-get install -y \
     cmake \
@@ -89,6 +84,11 @@ RUN apt-get update && \
     lld \
     rsync \
     && apt-get clean
+
+RUN --mount=type=bind,from=builder,source=/,target=/mnt/ \
+    cp /mnt/cargo-zigbuild/target/$(cat /mnt/tmp/rust-target-triple)/release/cargo-zigbuild /usr/local/cargo/bin/
+RUN --mount=type=bind,from=builder,source=/,target=/mnt/ \
+    cp /mnt/rust-bindgen-0.72.1/target/$(cat /mnt/tmp/rust-target-triple)/release/bindgen /usr/local/cargo/bin/
 
 COPY --from=musl-cross-make /musl-cross-make/output /opt/musl-cross-make
 COPY --from=musl-cross-make /musl-cross-make/cmake /root/cmake-overrides
