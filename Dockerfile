@@ -47,6 +47,18 @@ WORKDIR /musl-cross-make
 
 RUN ./make-arch.sh aarch64 riscv64 x86_64
 
+FROM --platform=linux/amd64 alpine AS sysroot_amd64
+
+RUN apk add fuse3 fuse3-dev fuse3-static musl-dev pkgconfig
+
+FROM --platform=linux/arm64 alpine AS sysroot_arm64
+
+RUN apk add fuse3 fuse3-dev fuse3-static musl-dev pkgconfig
+
+FROM --platform=linux/riscv64 alpine AS sysroot_riscv64
+
+RUN apk add fuse3 fuse3-dev fuse3-static musl-dev pkgconfig
+
 FROM rust:$RUST_VERSION-trixie
 
 # Install Zig
@@ -92,3 +104,7 @@ RUN --mount=type=bind,from=builder,source=/,target=/mnt/ \
 
 COPY --from=musl-cross-make /musl-cross-make/output /opt/musl-cross-make
 COPY --from=musl-cross-make /musl-cross-make/cmake /root/cmake-overrides
+
+COPY --from=sysroot_amd64 / /opt/sysroot/x86_64/
+COPY --from=sysroot_arm64 / /opt/sysroot/aarch64/
+COPY --from=sysroot_riscv64 / /opt/sysroot/riscv64/
