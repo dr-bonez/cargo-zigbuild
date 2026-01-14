@@ -86,7 +86,7 @@ RUN rustup default beta \
     aarch64-apple-darwin \
     x86_64-pc-windows-gnu \
     aarch64-pc-windows-gnullvm \
-    && rustup component add rustfmt
+    && rustup component add rustfmt rust-src
 
 RUN apt-get update && \
     apt-get install -y \
@@ -108,3 +108,7 @@ COPY --from=musl-cross-make /musl-cross-make/cmake /root/cmake-overrides
 COPY --from=sysroot_amd64 / /opt/sysroot/x86_64/
 COPY --from=sysroot_arm64 / /opt/sysroot/aarch64/
 COPY --from=sysroot_riscv64 / /opt/sysroot/riscv64/
+
+# Configure riscv64gc to use RVA23U64 profile (ratified October 2024)
+# Rust doesn't support -C target-cpu=rva23u64, so we specify individual mandatory extensions
+ENV CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_MUSL_RUSTFLAGS="-C target-cpu=generic-rv64 -C target-feature=+v,+zicsr,+zifencei,+zicntr,+zihpm,+ziccif,+ziccamoa,+zicclsm,+ziccrse,+za64rs,+zihintpause,+zic64b,+zicbom,+zicbop,+zicboz,+zba,+zbb,+zbs,+zfhmin,+zkt,+zvfhmin,+zvbb,+zvkt,+zihintntl,+zicond,+zimop,+zcmop,+zcb,+zfa,+zawrs,+supm"

@@ -1,0 +1,105 @@
+RVA23U64 Profile - MANDATORY Extensions
+========================================
+Official spec ratified October 2024
+
+RECOMMENDED APPROACH:
+---------------------
+Use -march=rva23u64 (GCC 15.1.0+, Clang/LLVM) to automatically enable
+ALL mandatory extensions including hardware-property extensions.
+
+Base ISA (rv64gc):
+------------------
+i       - Integer base ISA (64-bit)
+m       - Integer multiplication and division
+a       - Atomic instructions
+f       - Single-precision floating-point
+d       - Double-precision floating-point
+c       - Compressed instructions
+
+Mandatory Extensions (31 total):
+---------------------------------
+v           - Vector extension
+zicsr       - Control and Status Register instructions
+zifencei    - Instruction-fetch fence
+zicntr      - Base counters and timers
+zihpm       - Hardware performance counters
+ziccif      - Main memory supports instruction fetch with atomicity guarantee
+ziccamoa    - Main memory supports AMO with atomicity guarantee
+zicclsm     - Main memory supports misaligned loads/stores
+za64rs      - Reservation set size of at most 64 bytes
+zihintpause - Pause hint instruction
+zic64b      - Cache block size is 64 bytes
+zicbom      - Cache-block management operations
+zicbop      - Cache-block prefetch operations
+zicboz      - Cache-block zero operations
+zba         - Address generation (bit manipulation)
+zbb         - Basic bit manipulation
+zbs         - Single-bit instructions (bit manipulation)
+zfhmin      - Half-precision floating-point (minimal subset)
+zkt         - Data-independent execution latency
+zvfhmin     - Vector half-precision floating-point (minimal)
+zvbb        - Vector basic bit manipulation
+zvkt        - Vector data-independent execution latency
+zihintntl   - Non-temporal locality hints
+zicond      - Integer conditional operations
+zimop       - May-be-operations for integer
+zcmop       - May-be-operations for compressed
+zcb         - Additional compressed instructions
+zfa         - Additional floating-point instructions
+zawrs       - Wait-on-reservation-set instructions
+supm        - Pointer masking (supervisor mode support)
+ziccrse     - Forward progress on LR/SC in main memory
+
+GCC/Clang/CMake Configuration:
+------------------------------
+RECOMMENDED: -march=rva23u64
+
+This automatically enables all mandatory extensions including hardware-property
+extensions (supm, ziccrse) and extension subsets (zmmul, zaamo, zalrsc, zca,
+zve*, zvkb, zvl*) that are required for full RVA23U64 compliance.
+
+Manual Extension String (for reference only, NOT recommended):
+---------------------------------------------------------------
+rv64gc_v_zicsr_zifencei_zicntr_zihpm_ziccif_ziccamoa_zicclsm_za64rs_zihintpause_zic64b_zicbom_zicbop_zicboz_zba_zbb_zbs_zfhmin_zkt_zvfhmin_zvbb_zvkt_zihintntl_zicond_zimop_zcmop_zcb_zfa_zawrs_supm
+
+Rust RUSTFLAGS Configuration:
+------------------------------
+Rust doesn't support -C target-cpu=rva23u64, so specify individual extensions:
+
+-C target-cpu=generic-rv64 -C target-feature=+v,+zicsr,+zifencei,+zicntr,+zihpm,+ziccif,+ziccamoa,+zicclsm,+ziccrse,+za64rs,+zihintpause,+zic64b,+zicbom,+zicbop,+zicboz,+zba,+zbb,+zbs,+zfhmin,+zkt,+zvfhmin,+zvbb,+zvkt,+zihintntl,+zicond,+zimop,+zcmop,+zcb,+zfa,+zawrs,+supm
+
+Note: supm is supported in LLVM 19+ (Rust uses LLVM backend). Extension subsets
+(zmmul, zaamo, zalrsc, zca, zve*, zvkb, zvl*) are implied by their parent extensions.
+
+Zig mcpu Configuration:
+-----------------------
+Zig doesn't support rva23u64 profile yet, so specify individual extensions:
+
+generic_rv64+m+a+f+d+c+v+zicsr+zifencei+zicntr+zihpm+ziccif+ziccamoa+zicclsm+ziccrse+za64rs+zihintpause+zic64b+zicbom+zicbop+zicboz+zba+zbb+zbs+zfhmin+zkt+zvfhmin+zvbb+zvkt+zihintntl+zicond+zimop+zcmop+zcb+zfa+zawrs+supm
+
+Note: supm is supported via Zig's LLVM backend. Extension subsets are implied
+by their parent extensions.
+
+Implementation Notes:
+---------------------
+- GCC 15.1.0+ with -march=rva23u64 provides COMPLETE profile compliance
+- Rust and Zig configurations include ALL 31 mandatory extensions via LLVM backend
+- supm enables compiler optimizations by declaring pointer masking availability
+- Extension subsets (zmmul, zaamo, zalrsc, zca, zve*, zvkb, zvl*) are implied
+  by their parent extensions in manual configurations
+
+ELF Binary Metadata:
+--------------------
+Binaries compiled with -march=rva23u64 embed the complete RVA23U64 profile in
+their ELF architecture string, including supm. This appears as:
+
+  rv64i2p1_m2p0_a2p1_..._supm1p0
+
+This is METADATA declaring platform requirements, not user-mode instructions.
+The supm extension tells the OS/loader: "This binary expects RVA23U64 compliance
+including pointer masking support." No user-mode instructions are generated from
+supm - it's a contract between the binary and the execution environment.
+
+This is why GCC's -march=rva23u64 is superior to manual extension lists: it
+correctly declares complete platform requirements in ELF metadata, even for
+extensions that don't generate user-mode instructions.

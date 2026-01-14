@@ -39,7 +39,11 @@ fn should_use_clang_for_macos() -> bool {
 /// Find clang binary path
 fn find_clang() -> Result<PathBuf> {
     let clang = env::var("CARGO_ZIGBUILD_CLANG_PATH").unwrap_or_else(|_| "clang".to_string());
-    which::which(&clang).with_context(|| format!("Failed to find clang at '{clang}'. Set CARGO_ZIGBUILD_CLANG_PATH to specify the path."))
+    which::which(&clang).with_context(|| {
+        format!(
+            "Failed to find clang at '{clang}'. Set CARGO_ZIGBUILD_CLANG_PATH to specify the path."
+        )
+    })
 }
 
 /// Find clang++ binary path
@@ -53,12 +57,16 @@ fn find_ar() -> Result<PathBuf> {
     let ar = env::var("CARGO_ZIGBUILD_AR_PATH").unwrap_or_else(|_| "llvm-ar".to_string());
     which::which(&ar)
         .or_else(|_| which::which("ar"))
-        .with_context(|| "Failed to find ar or llvm-ar. Set CARGO_ZIGBUILD_AR_PATH to specify the path.".to_string())
+        .with_context(|| {
+            "Failed to find ar or llvm-ar. Set CARGO_ZIGBUILD_AR_PATH to specify the path."
+                .to_string()
+        })
 }
 
 /// Find ranlib binary path (llvm-ranlib or system ranlib)
 fn find_ranlib() -> Result<PathBuf> {
-    let ranlib = env::var("CARGO_ZIGBUILD_RANLIB_PATH").unwrap_or_else(|_| "llvm-ranlib".to_string());
+    let ranlib =
+        env::var("CARGO_ZIGBUILD_RANLIB_PATH").unwrap_or_else(|_| "llvm-ranlib".to_string());
     which::which(&ranlib)
         .or_else(|_| which::which("ranlib"))
         .with_context(|| "Failed to find ranlib or llvm-ranlib. Set CARGO_ZIGBUILD_RANLIB_PATH to specify the path.".to_string())
@@ -1294,7 +1302,8 @@ pub fn prepare_zig_linker(target: &str) -> Result<ZigWrapper> {
                         "pentium4"
                     }
                 }
-                "riscv64gc" => "generic_rv64+m+a+f+d+c",
+                // RVA23U64 MANDATORY extensions only
+                "riscv64gc" => "generic_rv64+m+a+f+d+c+v+zicsr+zifencei+zicntr+zihpm+ziccif+ziccamoa+zicclsm+ziccrse+za64rs+zihintpause+zic64b+zicbom+zicbop+zicboz+zba+zbb+zbs+zfhmin+zkt+zvfhmin+zvbb+zvkt+zihintntl+zicond+zimop+zcmop+zcb+zfa+zawrs+supm",
                 "s390x" => "z10-vector",
                 _ => "",
             }
@@ -1637,7 +1646,14 @@ pub fn prepare_clang_linker(target: &str) -> Result<ZigWrapper> {
         format!("-isysroot {}", sdkroot.display()),
         "-g".to_owned(),
         "-fno-sanitize=all".to_owned(),
-        format!("-F{}", sdkroot.join("System").join("Library").join("Frameworks").display()),
+        format!(
+            "-F{}",
+            sdkroot
+                .join("System")
+                .join("Library")
+                .join("Frameworks")
+                .display()
+        ),
         "-DTARGET_OS_IPHONE=0".to_owned(),
     ];
 
@@ -1696,12 +1712,7 @@ pub fn prepare_clang_linker(target: &str) -> Result<ZigWrapper> {
 fn write_clang_wrapper(path: &Path, compiler: &Path, args: &str) -> Result<()> {
     let mut buf = Vec::<u8>::new();
     writeln!(&mut buf, "#!/bin/sh")?;
-    writeln!(
-        &mut buf,
-        "exec \"{}\" {} \"$@\"",
-        compiler.display(),
-        args
-    )?;
+    writeln!(&mut buf, "exec \"{}\" {} \"$@\"", compiler.display(), args)?;
 
     let existing_content = fs::read(path).unwrap_or_default();
     if existing_content != buf {
