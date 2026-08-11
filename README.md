@@ -40,6 +40,22 @@ on macOS, Windows and Linux you can also install zig from PyPI via `pip3 install
 2. Install Rust target via rustup, for example, `rustup target add aarch64-unknown-linux-gnu`
 3. Run `cargo zigbuild`, for example, `cargo zigbuild --target aarch64-unknown-linux-gnu`
 
+### Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| `CARGO_ZIGBUILD_PYTHON_PATH` | Python executable path when using Python `ziglang` package (default: `python3`) |
+| `CARGO_ZIGBUILD_ZIG_PATH` | Zig executable path (default: `zig`) |
+| `CARGO_ZIGBUILD_CACHE_DIR` | Cache directory for zig tools and wrappers |
+| `CARGO_ZIGBUILD_RUSTC_VERSION` | Override detected rustc version |
+| `SDKROOT` | Path to macOS SDK (auto-detected on macOS) |
+| `CMAKE_TOOLCHAIN_FILE` | Path to CMake toolchain file (also `CMAKE_TOOLCHAIN_FILE_<target>`, `TARGET_CMAKE_TOOLCHAIN_FILE`) |
+| `BINDGEN_EXTRA_CLANG_ARGS` | Extra clang arguments for bindgen (also `BINDGEN_EXTRA_CLANG_ARGS_<target>`) |
+| `PKG_CONFIG_SYSROOT_DIR` | System root for pkg-config (auto-set to `SDKROOT` for Apple targets) |
+| `OHOS_NDK_HOME` | Path to OpenHarmony NDK (required for `ohos` targets) |
+| `CFLAGS` | Additional C compiler flags |
+| `RUSTFLAGS` | Additional Rust compiler flags |
+
 ### Specify glibc version
 
 By default `--target` for `*-gnu` will have Zig implicitly build for a default version of glibc that varies based on the release of Zig ([v12 to v14 releases default to glibc 2.28](https://github.com/ziglang/zig/blob/0.14.1/lib/std/Target.zig#L473)).
@@ -109,7 +125,7 @@ Provided you have no stripped the symbols from your binary built, on Linux you c
    #!/bin/bash
    
    FILE_NAME=$1
-   readelf -W --version-info --dyn-syms ${FILE_NAME} \
+   LANG=C readelf -W --version-info --dyn-syms ${FILE_NAME} \
      | grep 'Name: GLIBC' \
      | sed -re 's/.*GLIBC_(.+) Flags.*/\1/g' \
      | sort -t . -k1,1n -k2,2n \
@@ -149,6 +165,9 @@ cargo zigbuild --target universal2-apple-darwin
    other target platforms can be added if you can make it work,
    pull requests are welcome.
 2. Only current Rust **stable** and **nightly** versions are regularly tested on CI, other versions may not work.
+3. When using zig 0.15+ with crates that use [bindgen](https://github.com/rust-lang/rust-bindgen),
+   you may need clang 18+ installed for bindgen to work correctly. This is because zig 0.15+
+   bundles libc++ 19 headers which require a compatible libclang version.
 
 Known upstream zig [issues](https://github.com/ziglang/zig/labels/zig%20cc):
 

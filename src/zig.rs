@@ -8,8 +8,9 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command};
 use std::str;
+use std::sync::OnceLock;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use fs_err as fs;
 use path_slash::PathBufExt;
 use serde::Deserialize;
@@ -19,19 +20,23 @@ use crate::linux::ARM_FEATURES_H;
 use crate::macos::{LIBCHARSET_TBD, LIBICONV_TBD};
 
 /// Check if we should use clang instead of zig for macOS targets.
-/// This is needed because Zig 0.14+ has a bug where --sysroot is prepended
+/// This is needed because Zig 0.14 has a bug where --sysroot is prepended
 /// to all -L paths, breaking build script outputs.
 /// See https://github.com/ziglang/zig/issues/24368
+///
+/// Zig 0.15+ is handled by passing `SDKROOT` through the environment instead of
+/// `--sysroot` (see `add_macos_specific_args`), so clang is only auto-selected
+/// for 0.14. Set `CARGO_ZIGBUILD_USE_CLANG=1` to force it on any version.
 fn should_use_clang_for_macos() -> bool {
     // Check if CARGO_ZIGBUILD_USE_CLANG is set to force clang usage
     if let Ok(val) = env::var("CARGO_ZIGBUILD_USE_CLANG") {
         return val == "1" || val.to_lowercase() == "true";
     }
-    // Auto-detect: use clang for Zig 0.14+ when SDKROOT is set
-    if env::var_os("SDKROOT").is_some() {
-        if let Ok(version) = Zig::zig_version() {
-            return (version.major, version.minor) >= (0, 14);
-        }
+    // Auto-detect: use clang for Zig 0.14 when SDKROOT is set
+    if env::var_os("SDKROOT").is_some()
+        && let Ok(version) = Zig::zig_version()
+    {
+        return (version.major, version.minor) == (0, 14);
     }
     false
 }
@@ -110,43 +115,190 @@ pub enum Zig {
         #[arg(num_args = 1.., trailing_var_arg = true)]
         args: Vec<String>,
     },
+    /// `zig dlltool` wrapper
+    #[command(name = "dlltool")]
+    Dlltool {
+        /// `zig dlltool` arguments
+        #[arg(num_args = 1.., trailing_var_arg = true)]
+        args: Vec<String>,
+    },
 }
 
 struct TargetInfo {
     target: Option<String>,
-    is_musl: bool,
-    is_windows_gnu: bool,
-    is_windows_msvc: bool,
-    is_arm: bool,
-    is_i386: bool,
-    is_riscv64: bool,
-    is_mips32: bool,
-    is_macos: bool,
-    is_ohos: bool,
-    is_freebsd: bool,
 }
 
 impl TargetInfo {
     fn new(target: Option<&String>) -> Self {
         Self {
             target: target.cloned(),
-            is_musl: target.map(|x| x.contains("musl")).unwrap_or_default(),
-            is_windows_gnu: target
-                .map(|x| x.contains("windows-gnu"))
-                .unwrap_or_default(),
-            is_windows_msvc: target
-                .map(|x| x.contains("windows-msvc"))
-                .unwrap_or_default(),
-            is_arm: target.map(|x| x.starts_with("arm")).unwrap_or_default(),
-            is_i386: target.map(|x| x.starts_with("i386")).unwrap_or_default(),
-            is_riscv64: target.map(|x| x.starts_with("riscv64")).unwrap_or_default(),
-            is_mips32: target
-                .map(|x| x.starts_with("mips") && !x.starts_with("mips64"))
-                .unwrap_or_default(),
-            is_macos: target.map(|x| x.contains("macos")).unwrap_or_default(),
-            is_ohos: target.map(|x| x.contains("ohos")).unwrap_or_default(),
-            is_freebsd: target.map(|x| x.contains("freebsd")).unwrap_or_default(),
         }
+    }
+
+    // Architecture helpers
+    fn is_arm(&self) -> bool {
+        self.target
+            .as_ref()
+            .map(|x| x.starts_with("arm"))
+            .unwrap_or_default()
+    }
+
+    fn is_aarch64(&self) -> bool {
+        self.target
+            .as_ref()
+            .map(|x| x.starts_with("aarch64"))
+            .unwrap_or_default()
+    }
+
+    fn is_aarch64_be(&self) -> bool {
+        self.target
+            .as_ref()
+            .map(|x| x.starts_with("aarch64_be"))
+            .unwrap_or_default()
+    }
+
+    fn is_i386(&self) -> bool {
+        self.target
+            .as_ref()
+            .map(|x| x.starts_with("i386"))
+            .unwrap_or_default()
+    }
+
+    fn is_i686(&self) -> bool {
+        self.target
+            .as_ref()
+            .map(|x| x.starts_with("i686") || x.starts_with("x86-"))
+            .unwrap_or_default()
+    }
+
+    fn is_riscv64(&self) -> bool {
+        self.target
+            .as_ref()
+            .map(|x| x.starts_with("riscv64"))
+            .unwrap_or_default()
+    }
+
+    fn is_riscv32(&self) -> bool {
+        self.target
+            .as_ref()
+            .map(|x| x.starts_with("riscv32"))
+            .unwrap_or_default()
+    }
+
+    fn is_mips32(&self) -> bool {
+        self.target
+            .as_ref()
+            .map(|x| x.starts_with("mips") && !x.starts_with("mips64"))
+            .unwrap_or_default()
+    }
+
+    // libc helpers
+    fn is_musl(&self) -> bool {
+        self.target
+            .as_ref()
+            .map(|x| x.contains("musl"))
+            .unwrap_or_default()
+    }
+
+    // Platform helpers
+    fn is_macos(&self) -> bool {
+        self.target
+            .as_ref()
+            .map(|x| x.contains("macos") || x.contains("maccatalyst"))
+            .unwrap_or_default()
+    }
+
+    fn is_darwin(&self) -> bool {
+        self.target
+            .as_ref()
+            .map(|x| x.contains("darwin"))
+            .unwrap_or_default()
+    }
+
+    fn is_apple_platform(&self) -> bool {
+        self.target
+            .as_ref()
+            .map(|x| {
+                x.contains("macos")
+                    || x.contains("darwin")
+                    || x.contains("ios")
+                    || x.contains("tvos")
+                    || x.contains("watchos")
+                    || x.contains("visionos")
+                    || x.contains("maccatalyst")
+            })
+            .unwrap_or_default()
+    }
+
+    fn is_ios(&self) -> bool {
+        self.target
+            .as_ref()
+            .map(|x| x.contains("ios") && !x.contains("visionos"))
+            .unwrap_or_default()
+    }
+
+    fn is_tvos(&self) -> bool {
+        self.target
+            .as_ref()
+            .map(|x| x.contains("tvos"))
+            .unwrap_or_default()
+    }
+
+    fn is_watchos(&self) -> bool {
+        self.target
+            .as_ref()
+            .map(|x| x.contains("watchos"))
+            .unwrap_or_default()
+    }
+
+    fn is_visionos(&self) -> bool {
+        self.target
+            .as_ref()
+            .map(|x| x.contains("visionos"))
+            .unwrap_or_default()
+    }
+
+    /// Returns the appropriate Apple CPU for the platform
+    fn apple_cpu(&self) -> &'static str {
+        if self.is_macos() || self.is_darwin() {
+            "apple_m1" // M-series for macOS
+        } else if self.is_visionos() {
+            "apple_m2" // M2 for Apple Vision Pro
+        } else if self.is_watchos() {
+            "apple_s5" // S-series for Apple Watch
+        } else if self.is_ios() || self.is_tvos() {
+            "apple_a14" // A-series for iOS/tvOS (iPhone 12 era - good baseline)
+        } else {
+            "generic"
+        }
+    }
+
+    fn is_freebsd(&self) -> bool {
+        self.target
+            .as_ref()
+            .map(|x| x.contains("freebsd"))
+            .unwrap_or_default()
+    }
+
+    fn is_windows_gnu(&self) -> bool {
+        self.target
+            .as_ref()
+            .map(|x| x.contains("windows-gnu"))
+            .unwrap_or_default()
+    }
+
+    fn is_windows_msvc(&self) -> bool {
+        self.target
+            .as_ref()
+            .map(|x| x.contains("windows-msvc"))
+            .unwrap_or_default()
+    }
+
+    fn is_ohos(&self) -> bool {
+        self.target
+            .as_ref()
+            .map(|x| x.contains("ohos"))
+            .unwrap_or_default()
     }
 }
 
@@ -159,7 +311,45 @@ impl Zig {
             Zig::Ar { args } => self.execute_tool("ar", args),
             Zig::Ranlib { args } => self.execute_compiler("ranlib", args),
             Zig::Lib { args } => self.execute_compiler("lib", args),
+            Zig::Dlltool { args } => self.execute_dlltool(args),
         }
+    }
+
+    /// Execute zig dlltool command
+    /// Filter out unsupported options for older zig versions (< 0.12)
+    pub fn execute_dlltool(&self, cmd_args: &[String]) -> Result<()> {
+        let zig_version = Zig::zig_version()?;
+        let needs_filtering = zig_version.major == 0 && zig_version.minor < 12;
+
+        if !needs_filtering {
+            return self.execute_tool("dlltool", cmd_args);
+        }
+
+        // Filter out --no-leading-underscore, --temp-prefix, and -t (short form)
+        // These options are not supported by zig dlltool in versions < 0.12
+        let mut filtered_args = Vec::with_capacity(cmd_args.len());
+        let mut skip_next = false;
+        for arg in cmd_args {
+            if skip_next {
+                skip_next = false;
+                continue;
+            }
+            if arg == "--no-leading-underscore" {
+                continue;
+            }
+            if arg == "--temp-prefix" || arg == "-t" {
+                // Skip this arg and the next one (the value)
+                skip_next = true;
+                continue;
+            }
+            // Handle --temp-prefix=value and -t=value forms
+            if arg.starts_with("--temp-prefix=") || arg.starts_with("-t=") {
+                continue;
+            }
+            filtered_args.push(arg.clone());
+        }
+
+        self.execute_tool("dlltool", &filtered_args)
     }
 
     /// Execute zig cc/c++ command
@@ -178,10 +368,21 @@ impl Zig {
 
         let mut new_cmd_args = Vec::with_capacity(cmd_args.len());
         let mut skip_next_arg = false;
+        let mut seen_target = false;
         for arg in cmd_args {
             if skip_next_arg {
                 skip_next_arg = false;
                 continue;
+            }
+            // Our wrapper script already passes the correct -target;
+            // skip any duplicate -target from rustc to avoid conflicts
+            // (e.g. rustc passes arm64 which zig doesn't recognize for some targets)
+            if arg == "-target" {
+                if seen_target {
+                    skip_next_arg = true;
+                    continue;
+                }
+                seen_target = true;
             }
             let args = if arg.starts_with('@') && arg.ends_with("linker-arguments") {
                 vec![self.process_linker_response_file(
@@ -191,34 +392,47 @@ impl Zig {
                     &target_info,
                 )?]
             } else {
-                self.filter_linker_arg(arg, &rustc_ver, &zig_version, &target_info)
-            };
-            for arg in args {
-                if arg == "-Wl,-exported_symbols_list" {
-                    // Filter out this and the next argument
-                    skip_next_arg = true;
-                } else {
-                    new_cmd_args.push(arg);
+                match self.filter_linker_arg(arg, &rustc_ver, &zig_version, &target_info) {
+                    FilteredArg::Keep(filtered) => filtered,
+                    FilteredArg::Skip => continue,
+                    FilteredArg::SkipWithNext => {
+                        skip_next_arg = true;
+                        continue;
+                    }
                 }
-            }
+            };
+            new_cmd_args.extend(args);
         }
 
-        if target_info.is_mips32 {
+        if target_info.is_mips32() {
             // See https://github.com/ziglang/zig/issues/4925#issuecomment-1499823425
             new_cmd_args.push("-Wl,-z,notext".to_string());
+        }
+
+        if target_info.is_windows_gnu() && (zig_version.major, zig_version.minor) >= (0, 16) {
+            new_cmd_args.push("-lcompiler_rt".to_string());
         }
 
         if self.has_undefined_dynamic_lookup(cmd_args) {
             new_cmd_args.push("-Wl,-undefined=dynamic_lookup".to_string());
         }
-        if target_info.is_macos {
+        if target_info.is_macos() {
             if self.should_add_libcharset(cmd_args, &zig_version) {
                 new_cmd_args.push("-lcharset".to_string());
             }
             self.add_macos_specific_args(&mut new_cmd_args, &zig_version)?;
         }
 
-        let mut child = Self::command()?
+        // For Zig >= 0.15 with macOS, set SDKROOT environment variable
+        // if it exists, instead of passing --sysroot
+        let mut command = Self::command()?;
+        if (zig_version.major, zig_version.minor) >= (0, 15)
+            && let Some(sdkroot) = Self::macos_sdk_root()
+        {
+            command.env("SDKROOT", sdkroot);
+        }
+
+        let mut child = command
             .arg(cmd)
             .args(new_cmd_args)
             .spawn()
@@ -241,7 +455,7 @@ impl Zig {
         // See https://github.com/rust-lang/rust/issues/41190
         // and https://github.com/rust-lang/rust/blob/87937d3b6c302dfedfa5c4b94d0a30985d46298d/compiler/rustc_codegen_ssa/src/back/link.rs#L1373-L1382
         let content_bytes = fs::read(arg.trim_start_matches('@'))?;
-        let content = if target_info.is_windows_msvc {
+        let content = if target_info.is_windows_msvc() {
             if content_bytes[0..2] != [255, 254] {
                 bail!(
                     "linker response file `{}` didn't start with a utf16 BOM",
@@ -266,17 +480,19 @@ impl Zig {
                 )
             })?
         };
-        let mut link_args: Vec<_> = content
-            .split('\n')
-            .flat_map(|arg| self.filter_linker_arg(arg, &rustc_ver, &zig_version, &target_info))
-            .collect();
+        let mut link_args: Vec<_> = filter_linker_args(
+            content.split('\n').map(|s| s.to_string()),
+            rustc_ver,
+            zig_version,
+            target_info,
+        );
         if self.has_undefined_dynamic_lookup(&link_args) {
             link_args.push("-Wl,-undefined=dynamic_lookup".to_string());
         }
-        if target_info.is_macos && self.should_add_libcharset(&link_args, &zig_version) {
+        if target_info.is_macos() && self.should_add_libcharset(&link_args, zig_version) {
             link_args.push("-lcharset".to_string());
         }
-        if target_info.is_windows_msvc {
+        if target_info.is_windows_msvc() {
             let new_content = link_args.join("\n");
             let mut out = Vec::with_capacity((1 + new_content.len()) * 2);
             // start the stream with a UTF-16 BOM
@@ -298,139 +514,181 @@ impl Zig {
         rustc_ver: &rustc_version::Version,
         zig_version: &semver::Version,
         target_info: &TargetInfo,
-    ) -> Vec<String> {
-        if arg == "-lgcc_s" {
-            // Replace libgcc_s with libunwind
-            return vec!["-lunwind".to_string()];
-        } else if arg.starts_with("--target=") {
-            // We have already passed target via `-target`
-            return vec![];
-        }
-        if (target_info.is_arm || target_info.is_windows_gnu)
-            && arg.ends_with(".rlib")
-            && arg.contains("libcompiler_builtins-")
-        {
-            // compiler-builtins is duplicated with zig's compiler-rt
-            return vec![];
-        }
-        if target_info.is_windows_gnu {
-            #[allow(clippy::if_same_then_else)]
-            if arg == "-lgcc_eh" {
-                // zig doesn't provide gcc_eh alternative
-                // We use libc++ to replace it on windows gnu targets
-                return vec!["-lc++".to_string()];
-            } else if arg == "-Wl,-Bdynamic" && (zig_version.major, zig_version.minor) >= (0, 11) {
-                // https://github.com/ziglang/zig/pull/16058
-                // zig changes the linker behavior, -Bdynamic won't search *.a for mingw, but this may be fixed in the later version
-                // here is a workaround to replace the linker switch with -search_paths_first, which will search for *.dll,*lib first,
-                // then fallback to *.a
-                return vec!["-Wl,-search_paths_first".to_owned()];
-            } else if arg == "-lwindows" || arg == "-l:libpthread.a" || arg == "-lgcc" {
-                return vec![];
-            } else if arg == "-Wl,--disable-auto-image-base"
-                || arg == "-Wl,--dynamicbase"
-                || arg == "-Wl,--large-address-aware"
-                || (arg.starts_with("-Wl,")
-                    && (arg.ends_with("/list.def") || arg.ends_with("\\list.def")))
-            {
-                // https://github.com/rust-lang/rust/blob/f0bc76ac41a0a832c9ee621e31aaf1f515d3d6a5/compiler/rustc_target/src/spec/windows_gnu_base.rs#L23
-                // https://github.com/rust-lang/rust/blob/2fb0e8d162a021f8a795fb603f5d8c0017855160/compiler/rustc_target/src/spec/windows_gnu_base.rs#L22
-                // https://github.com/rust-lang/rust/blob/f0bc76ac41a0a832c9ee621e31aaf1f515d3d6a5/compiler/rustc_target/src/spec/i686_pc_windows_gnu.rs#L16
-                // zig doesn't support --disable-auto-image-base, --dynamicbase and --large-address-aware
-                return vec![];
-            } else if arg == "-lmsvcrt" {
-                return vec![];
-            }
-        } else if arg == "-Wl,--no-undefined-version" {
-            // https://github.com/rust-lang/rust/blob/542ed2bf72b232b245ece058fc11aebb1ca507d7/compiler/rustc_codegen_ssa/src/back/linker.rs#L723
-            // zig doesn't support --no-undefined-version
-            return vec![];
-        } else if arg == "-Wl,-znostart-stop-gc" {
-            // https://github.com/rust-lang/rust/blob/c580c498a1fe144d7c5b2dfc7faab1a229aa288b/compiler/rustc_codegen_ssa/src/back/link.rs#L3371
-            // zig doesn't support -znostart-stop-gc
-            return vec![];
-        }
-        if target_info.is_musl || target_info.is_ohos {
-            // Avoids duplicated symbols with both zig musl libc and the libc crate
-            if arg.ends_with(".o") && arg.contains("self-contained") && arg.contains("crt") {
-                return vec![];
-            } else if arg == "-Wl,-melf_i386" {
-                // unsupported linker arg: -melf_i386
-                return vec![];
-            }
-            if rustc_ver.major == 1
-                && rustc_ver.minor < 59
-                && arg.ends_with(".rlib")
-                && arg.contains("liblibc-")
-            {
-                // Rust distributes standalone libc.a in self-contained for musl since 1.59.0
-                // See https://github.com/rust-lang/rust/pull/90527
-                return vec![];
-            }
-            if arg == "-lc" {
-                return vec![];
-            }
-        }
-        if arg.starts_with("-march=") {
-            // Ignore `-march` option for arm* targets, we use `generic` + cpu features instead
-            if target_info.is_arm || target_info.is_i386 {
-                return vec![];
-            } else if target_info.is_riscv64 {
-                return vec!["-march=generic_rv64".to_string()];
-            } else if arg.starts_with("-march=armv8-a") {
-                let mut args_march = if target_info
-                    .target
-                    .as_ref()
-                    .map(|x| x.starts_with("aarch64-macos"))
-                    .unwrap_or_default()
-                {
-                    vec![arg.replace("armv8-a", "apple_m1")]
-                } else if target_info
-                    .target
-                    .as_ref()
-                    .map(|x| x.starts_with("aarch64-linux"))
-                    .unwrap_or_default()
-                {
-                    vec![arg
-                        .replace("armv8-a", "generic+v8a")
-                        .replace("simd", "neon")]
-                } else {
-                    vec![arg.to_string()]
-                };
-                if arg == "-march=armv8-a+crypto" {
-                    // Workaround for building sha1-asm on aarch64
-                    // See:
-                    // https://github.com/rust-cross/cargo-zigbuild/issues/149
-                    // https://github.com/RustCrypto/asm-hashes/blob/master/sha1/build.rs#L17-L19
-                    // https://github.com/ziglang/zig/issues/10411
-                    args_march.append(&mut vec![
-                        "-Xassembler".to_owned(),
-                        "-march=armv8-a+crypto".to_owned(),
-                    ]);
-                }
-                return args_march;
-            }
-        }
-        if target_info.is_macos {
-            if arg.starts_with("-Wl,-exported_symbols_list,") {
-                // zig doesn't support -exported_symbols_list arg
-                // https://clang.llvm.org/docs/ClangCommandLineReference.html#cmdoption-clang-exported_symbols_list
-                return vec![];
-            }
-            if arg == "-Wl,-dylib" {
-                // zig doesn't support -dylib
-                return vec![];
-            }
-        }
-        if target_info.is_freebsd {
-            let ignored_libs = ["-lkvm", "-lmemstat", "-lprocstat", "-ldevstat"];
-            if ignored_libs.contains(&arg) {
-                return vec![];
-            }
-        }
-        vec![arg.to_string()]
+    ) -> FilteredArg {
+        filter_linker_arg(arg, rustc_ver, zig_version, target_info)
     }
+}
 
+enum FilteredArg {
+    Keep(Vec<String>),
+    Skip,
+    SkipWithNext,
+}
+
+fn filter_linker_args(
+    args: impl IntoIterator<Item = String>,
+    rustc_ver: &rustc_version::Version,
+    zig_version: &semver::Version,
+    target_info: &TargetInfo,
+) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut skip_next = false;
+    for arg in args {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        match filter_linker_arg(&arg, rustc_ver, zig_version, target_info) {
+            FilteredArg::Keep(filtered) => result.extend(filtered),
+            FilteredArg::Skip => {}
+            FilteredArg::SkipWithNext => {
+                skip_next = true;
+            }
+        }
+    }
+    result
+}
+
+fn filter_linker_arg(
+    arg: &str,
+    rustc_ver: &rustc_version::Version,
+    zig_version: &semver::Version,
+    target_info: &TargetInfo,
+) -> FilteredArg {
+    if arg == "-lgcc_s" {
+        return FilteredArg::Keep(vec!["-lunwind".to_string()]);
+    } else if arg.starts_with("--target=") {
+        return FilteredArg::Skip;
+    } else if arg.starts_with("-e") && arg.len() > 2 && !arg.starts_with("-export") {
+        let entry = &arg[2..];
+        return FilteredArg::Keep(vec![format!("-Wl,--entry={}", entry)]);
+    }
+    if (target_info.is_arm() || target_info.is_windows_gnu())
+        && arg.ends_with(".rlib")
+        && arg.contains("libcompiler_builtins-")
+    {
+        return FilteredArg::Skip;
+    }
+    if target_info.is_windows_gnu() {
+        #[allow(clippy::if_same_then_else)]
+        if arg == "-lgcc_eh"
+            && ((zig_version.major, zig_version.minor) < (0, 14) || target_info.is_i686())
+        {
+            return FilteredArg::Keep(vec!["-lc++".to_string()]);
+        } else if arg.ends_with("rsbegin.o") || arg.ends_with("rsend.o") {
+            if target_info.is_i686() {
+                return FilteredArg::Skip;
+            }
+        } else if arg == "-Wl,-Bdynamic" && (zig_version.major, zig_version.minor) >= (0, 11) {
+            return FilteredArg::Keep(vec!["-Wl,-search_paths_first".to_owned()]);
+        } else if arg == "-lwindows" || arg == "-l:libpthread.a" || arg == "-lgcc" {
+            return FilteredArg::Skip;
+        } else if arg == "-Wl,--disable-auto-image-base"
+            || arg == "-Wl,--dynamicbase"
+            || arg == "-Wl,--large-address-aware"
+            || (arg.starts_with("-Wl,")
+                && (arg.ends_with("/list.def") || arg.ends_with("\\list.def")))
+        {
+            return FilteredArg::Skip;
+        } else if arg == "-lmsvcrt" {
+            return FilteredArg::Skip;
+        }
+    } else if arg == "-Wl,--no-undefined-version"
+        || arg == "-Wl,-znostart-stop-gc"
+        // See https://github.com/rust-lang/rust/pull/155453
+        || arg == "-Wl,--fix-cortex-a53-843419"
+        || arg.starts_with("-Wl,-plugin-opt")
+    {
+        return FilteredArg::Skip;
+    }
+    if target_info.is_musl() || target_info.is_ohos() {
+        if (arg.ends_with(".o") && arg.contains("self-contained") && arg.contains("crt"))
+            || arg == "-Wl,-melf_i386"
+        {
+            return FilteredArg::Skip;
+        }
+        if rustc_ver.major == 1
+            && rustc_ver.minor < 59
+            && arg.ends_with(".rlib")
+            && arg.contains("liblibc-")
+        {
+            return FilteredArg::Skip;
+        }
+        if arg == "-lc" {
+            return FilteredArg::Skip;
+        }
+    }
+    // zig cc only supports -Wp,-MD, -Wp,-MMD, and -Wp,-MT;
+    // strip all other -Wp, args (e.g. -Wp,-U_FORTIFY_SOURCE from CMake)
+    // https://github.com/ziglang/zig/blob/0.15.2/src/main.zig#L2798
+    if arg.starts_with("-Wp,")
+        && !arg.starts_with("-Wp,-MD")
+        && !arg.starts_with("-Wp,-MMD")
+        && !arg.starts_with("-Wp,-MT")
+    {
+        return FilteredArg::Skip;
+    }
+    if arg.starts_with("-march=") {
+        if target_info.is_arm() || target_info.is_i386() {
+            return FilteredArg::Skip;
+        } else if target_info.is_riscv64() {
+            return FilteredArg::Keep(vec!["-march=generic_rv64".to_string()]);
+        } else if target_info.is_riscv32() {
+            return FilteredArg::Keep(vec!["-march=generic_rv32".to_string()]);
+        } else if arg.starts_with("-march=armv")
+            && (target_info.is_aarch64() || target_info.is_aarch64_be())
+        {
+            let march_value = arg.strip_prefix("-march=").unwrap();
+            let features = if let Some(pos) = march_value.find('+') {
+                &march_value[pos..]
+            } else {
+                ""
+            };
+            let base_cpu = if target_info.is_apple_platform() {
+                target_info.apple_cpu()
+            } else {
+                "generic"
+            };
+            let mut result = vec![format!("-mcpu={}{}", base_cpu, features)];
+            if features.contains("+crypto") {
+                result.append(&mut vec!["-Xassembler".to_owned(), arg.to_string()]);
+            }
+            return FilteredArg::Keep(result);
+        }
+    }
+    if target_info.is_apple_platform() {
+        if (zig_version.major, zig_version.minor) < (0, 16) {
+            if arg.starts_with("-Wl,-exported_symbols_list,") {
+                return FilteredArg::Skip;
+            }
+            if arg == "-Wl,-exported_symbols_list" {
+                return FilteredArg::SkipWithNext;
+            }
+        }
+        if arg == "-Wl,-dylib" {
+            return FilteredArg::Skip;
+        }
+    }
+    // Handle two-arg form on all platforms (cross-compilation from non-Apple hosts)
+    if (zig_version.major, zig_version.minor) < (0, 16) {
+        if arg == "-Wl,-exported_symbols_list" || arg == "-Wl,--dynamic-list" {
+            return FilteredArg::SkipWithNext;
+        }
+        if arg.starts_with("-Wl,-exported_symbols_list,") || arg.starts_with("-Wl,--dynamic-list,")
+        {
+            return FilteredArg::Skip;
+        }
+    }
+    if target_info.is_freebsd() {
+        let ignored_libs = ["-lkvm", "-lmemstat", "-lprocstat", "-ldevstat"];
+        if ignored_libs.contains(&arg) {
+            return FilteredArg::Skip;
+        }
+    }
+    FilteredArg::Keep(vec![arg.to_string()])
+}
+
+impl Zig {
     fn has_undefined_dynamic_lookup(&self, args: &[String]) -> bool {
         let undefined = args
             .iter()
@@ -454,32 +712,63 @@ impl Zig {
         zig_version: &semver::Version,
     ) -> Result<()> {
         let sdkroot = Self::macos_sdk_root();
-        if (zig_version.major, zig_version.minor) >= (0, 12)
-            && (zig_version.major, zig_version.minor) < (0, 14)
-        {
-            // Zig 0.12-0.13 requires passing `--sysroot`
-            // Zig 0.14+ has a bug where --sysroot is prepended to all -L paths,
-            // breaking build script outputs. Don't use --sysroot for 0.14+.
-            // See https://github.com/ziglang/zig/issues/24368
-            if let Some(ref sdkroot) = sdkroot {
+        if (zig_version.major, zig_version.minor) >= (0, 12) {
+            // Zig 0.12.0+ requires passing `--sysroot`
+            // However, for Zig 0.15+, we should use SDKROOT environment variable instead
+            // to avoid issues with library paths being interpreted relative to sysroot
+            // (see https://github.com/ziglang/zig/issues/24368)
+            if let Some(ref sdkroot) = sdkroot
+                && (zig_version.major, zig_version.minor) < (0, 15)
+            {
                 new_cmd_args.push(format!("--sysroot={}", sdkroot.display()));
             }
+            // For Zig >= 0.15, SDKROOT will be set as environment variable
         }
         if let Some(ref sdkroot) = sdkroot {
-            new_cmd_args.extend_from_slice(&[
-                "-isystem".to_string(),
-                format!("{}", sdkroot.join("usr").join("include").display()),
-                format!("-L{}", sdkroot.join("usr").join("lib").display()),
-                format!(
-                    "-F{}",
-                    sdkroot
-                        .join("System")
-                        .join("Library")
-                        .join("Frameworks")
-                        .display()
-                ),
-                "-DTARGET_OS_IPHONE=0".to_string(),
-            ]);
+            if (zig_version.major, zig_version.minor) < (0, 15) {
+                // For zig < 0.15, we need to explicitly add SDK paths with --sysroot
+                new_cmd_args.extend_from_slice(&[
+                    "-isystem".to_string(),
+                    format!("{}", sdkroot.join("usr").join("include").display()),
+                    format!("-L{}", sdkroot.join("usr").join("lib").display()),
+                    format!(
+                        "-F{}",
+                        sdkroot
+                            .join("System")
+                            .join("Library")
+                            .join("Frameworks")
+                            .display()
+                    ),
+                    "-DTARGET_OS_IPHONE=0".to_string(),
+                ]);
+            } else {
+                // For zig >= 0.15 with SDKROOT, we still need to add framework paths
+                // Use -iframework for framework header search
+                new_cmd_args.extend_from_slice(&[
+                    "-isystem".to_string(),
+                    format!("{}", sdkroot.join("usr").join("include").display()),
+                    format!("-L{}", sdkroot.join("usr").join("lib").display()),
+                    format!(
+                        "-F{}",
+                        sdkroot
+                            .join("System")
+                            .join("Library")
+                            .join("Frameworks")
+                            .display()
+                    ),
+                    // Also add the SYSTEM framework search path
+                    "-iframework".to_string(),
+                    format!(
+                        "{}",
+                        sdkroot
+                            .join("System")
+                            .join("Library")
+                            .join("Frameworks")
+                            .display()
+                    ),
+                    "-DTARGET_OS_IPHONE=0".to_string(),
+                ]);
+            }
         }
 
         // Add the deps directory that contains `.tbd` files to the library search path
@@ -515,18 +804,35 @@ impl Zig {
     }
 
     fn zig_version() -> Result<semver::Version> {
+        static ZIG_VERSION: OnceLock<semver::Version> = OnceLock::new();
+
+        if let Some(version) = ZIG_VERSION.get() {
+            return Ok(version.clone());
+        }
+        // Check for cached version from environment variable first
+        if let Ok(version_str) = env::var("CARGO_ZIGBUILD_ZIG_VERSION")
+            && let Ok(version) = semver::Version::parse(&version_str)
+        {
+            return Ok(ZIG_VERSION.get_or_init(|| version).clone());
+        }
         let output = Self::command()?.arg("version").output()?;
         let version_str =
             str::from_utf8(&output.stdout).context("`zig version` didn't return utf8 output")?;
         let version = semver::Version::parse(version_str.trim())?;
-        Ok(version)
+        Ok(ZIG_VERSION.get_or_init(|| version).clone())
     }
 
     /// Search for `python -m ziglang` first and for `zig` second.
     pub fn find_zig() -> Result<(PathBuf, Vec<String>)> {
-        Self::find_zig_python()
+        static ZIG_PATH: OnceLock<(PathBuf, Vec<String>)> = OnceLock::new();
+
+        if let Some(cached) = ZIG_PATH.get() {
+            return Ok(cached.clone());
+        }
+        let result = Self::find_zig_python()
             .or_else(|_| Self::find_zig_bin())
-            .context("Failed to find zig")
+            .context("Failed to find zig")?;
+        Ok(ZIG_PATH.get_or_init(|| result).clone())
     }
 
     /// Detect the plain zig binary
@@ -574,10 +880,48 @@ impl Zig {
 
     /// Find zig lib directory
     pub fn lib_dir() -> Result<PathBuf> {
+        static LIB_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+        if let Some(cached) = LIB_DIR.get() {
+            return Ok(cached.clone());
+        }
         let (zig, zig_args) = Self::find_zig()?;
+        let zig_version = Self::zig_version()?;
         let output = Command::new(zig).args(zig_args).arg("env").output()?;
-        let zig_env: ZigEnv = serde_json::from_slice(&output.stdout)?;
-        Ok(PathBuf::from(zig_env.lib_dir))
+        let parse_zon_lib_dir = || -> Result<PathBuf> {
+            let output_str =
+                str::from_utf8(&output.stdout).context("`zig env` didn't return utf8 output")?;
+            let lib_dir = output_str
+                .find(".lib_dir")
+                .and_then(|idx| {
+                    let bytes = output_str.as_bytes();
+                    let mut start = idx;
+                    while start < bytes.len() && bytes[start] != b'"' {
+                        start += 1;
+                    }
+                    if start >= bytes.len() {
+                        return None;
+                    }
+                    let mut end = start + 1;
+                    while end < bytes.len() && bytes[end] != b'"' {
+                        end += 1;
+                    }
+                    if end >= bytes.len() {
+                        return None;
+                    }
+                    Some(&output_str[start + 1..end])
+                })
+                .context("Failed to parse lib_dir from `zig env` ZON output")?;
+            Ok(PathBuf::from(lib_dir))
+        };
+        let lib_dir = if zig_version >= semver::Version::new(0, 15, 0) {
+            parse_zon_lib_dir()?
+        } else {
+            serde_json::from_slice::<ZigEnv>(&output.stdout)
+                .map(|zig_env| PathBuf::from(zig_env.lib_dir))
+                .or_else(|_| parse_zon_lib_dir())?
+        };
+        Ok(LIB_DIR.get_or_init(|| lib_dir).clone())
     }
 
     fn add_env_if_missing<K, V>(command: &mut Command, name: K, value: V)
@@ -601,8 +945,31 @@ impl Zig {
         enable_zig_ar: bool,
     ) -> Result<()> {
         // setup zig as linker
-        let rust_targets = cargo
-            .target
+        let cargo_config = cargo_config2::Config::load()?;
+        // Use targets from CLI args, or fall back to cargo config's build.target
+        let config_targets;
+        let raw_targets: &[String] = if cargo.target.is_empty() {
+            if let Some(targets) = &cargo_config.build.target {
+                config_targets = targets
+                    .iter()
+                    .map(|t| t.triple().to_string())
+                    .collect::<Vec<_>>();
+                &config_targets
+            } else {
+                &cargo.target
+            }
+        } else {
+            &cargo.target
+        };
+        #[cfg(target_os = "macos")]
+        if !raw_targets.is_empty()
+            && let Err(err) = crate::macos::rlimit::raise_nofile_limit()
+        {
+            eprintln!(
+                "warning: failed to raise the open file limit: {err}; large builds may fail with ProcessFdQuotaExceeded (try `ulimit -n 65536`)"
+            );
+        }
+        let rust_targets = raw_targets
             .iter()
             .map(|target| target.split_once('.').map(|(t, _)| t).unwrap_or(target))
             .collect::<Vec<&str>>();
@@ -613,9 +980,9 @@ impl Zig {
             rustc_meta.semver.to_string(),
         );
         let host_target = &rustc_meta.host;
-        for (parsed_target, raw_target) in rust_targets.iter().zip(&cargo.target) {
+        for (parsed_target, raw_target) in rust_targets.iter().zip(raw_targets) {
             let env_target = parsed_target.replace('-', "_");
-            let zig_wrapper = prepare_zig_linker(raw_target)?;
+            let zig_wrapper = prepare_zig_linker(raw_target, &cargo_config)?;
 
             if is_mingw_shell() {
                 let zig_cc = zig_wrapper.cc.to_slash_lossy();
@@ -659,25 +1026,47 @@ impl Zig {
                 && env::var_os(format!("CMAKE_TOOLCHAIN_FILE_{parsed_target}")).is_none()
                 && env::var_os("TARGET_CMAKE_TOOLCHAIN_FILE").is_none()
                 && env::var_os("CMAKE_TOOLCHAIN_FILE").is_none()
-            {
-                if let Ok(cmake_toolchain_file) =
+                && let Ok(cmake_toolchain_file) =
                     Self::setup_cmake_toolchain(parsed_target, &zig_wrapper, enable_zig_ar)
-                {
-                    cmd.env(cmake_toolchain_file_env, cmake_toolchain_file);
-                }
+            {
+                cmd.env(cmake_toolchain_file_env, cmake_toolchain_file);
+            }
+
+            // On Windows, cmake defaults to the Visual Studio generator which ignores
+            // CMAKE_C_COMPILER from the toolchain file. Force Ninja to ensure zig cc
+            // is used for cross-compilation.
+            // See https://github.com/rust-cross/cargo-zigbuild/issues/174
+            if cfg!(target_os = "windows")
+                && env::var_os("CMAKE_GENERATOR").is_none()
+                && which::which("ninja").is_ok()
+            {
+                cmd.env("CMAKE_GENERATOR", "Ninja");
             }
 
             if raw_target.contains("windows-gnu") {
                 cmd.env("WINAPI_NO_BUNDLED_LIBRARIES", "1");
-            }
-
-            if raw_target.contains("apple-darwin") {
-                if let Some(sdkroot) = Self::macos_sdk_root() {
-                    if env::var_os("PKG_CONFIG_SYSROOT_DIR").is_none() {
-                        // Set PKG_CONFIG_SYSROOT_DIR for pkg-config crate
-                        cmd.env("PKG_CONFIG_SYSROOT_DIR", sdkroot);
+                // Add the cache directory to PATH so rustc can find architecture-specific dlltool
+                // (e.g., x86_64-w64-mingw32-dlltool), but only if no system dlltool exists
+                // If system mingw-w64 dlltool exists, prefer it over zig's dlltool
+                let triple: Triple = parsed_target.parse().unwrap_or_else(|_| Triple::unknown());
+                if !has_system_dlltool(&triple.architecture) {
+                    // zig_wrapper.ar lives in the per-exe wrapper dir
+                    let wrapper_dir = zig_wrapper.ar.parent().unwrap();
+                    let existing_path = env::var_os("PATH").unwrap_or_default();
+                    let paths = std::iter::once(wrapper_dir.to_path_buf())
+                        .chain(env::split_paths(&existing_path));
+                    if let Ok(new_path) = env::join_paths(paths) {
+                        cmd.env("PATH", new_path);
                     }
                 }
+            }
+
+            if raw_target.contains("apple-darwin")
+                && let Some(sdkroot) = Self::macos_sdk_root()
+                && env::var_os("PKG_CONFIG_SYSROOT_DIR").is_none()
+            {
+                // Set PKG_CONFIG_SYSROOT_DIR for pkg-config crate
+                cmd.env("PKG_CONFIG_SYSROOT_DIR", sdkroot);
             }
 
             // Enable unstable `target-applies-to-host` option automatically
@@ -699,23 +1088,23 @@ impl Zig {
                 // everyone seems to miss `#import <TargetConditionals.h>`...
                 options.push("-DTARGET_OS_IPHONE=0".to_string());
             }
-            let escaped_options = shlex::try_join(options.iter().map(|s| &s[..]))?;
+            let escaped_options = shell_words::join(options.iter().map(|s| &s[..]));
             let bindgen_env = "BINDGEN_EXTRA_CLANG_ARGS";
             let fallback_value = env::var(bindgen_env);
             for target in [&env_target[..], parsed_target] {
                 let name = format!("{bindgen_env}_{target}");
                 if let Ok(mut value) = env::var(&name).or(fallback_value.clone()) {
-                    if shlex::split(&value).is_none() {
+                    if shell_words::split(&value).is_err() {
                         // bindgen treats the whole string as a single argument if split fails
-                        value = shlex::try_quote(&value)?.into_owned();
+                        value = shell_words::quote(&value).into_owned();
                     }
                     if !value.is_empty() {
                         value.push(' ');
                     }
                     value.push_str(&escaped_options);
-                    env::set_var(name, value);
+                    unsafe { env::set_var(name, value) };
                 } else {
-                    env::set_var(name, escaped_options.clone());
+                    unsafe { env::set_var(name, escaped_options.clone()) };
                 }
             }
         }
@@ -830,8 +1219,7 @@ impl Zig {
             .position(|p| {
                 p == c_paths
                     .iter()
-                    .filter(|(kind, _)| *kind == Kind::Normal)
-                    .next()
+                    .find(|(kind, _)| *kind == Kind::Normal)
                     .unwrap()
             })
             .unwrap_or_default();
@@ -922,6 +1310,12 @@ impl Zig {
                 "-D_LIBCPP_ABI_VERSION=1",
                 "-D_LIBCPP_ABI_NAMESPACE=__1",
                 "-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_FAST",
+                // Required by zig 0.15+ libc++ for streambuf and other I/O headers
+                "-D_LIBCPP_HAS_LOCALIZATION=1",
+                "-D_LIBCPP_HAS_WIDE_CHARACTERS=1",
+                "-D_LIBCPP_HAS_UNICODE=1",
+                "-D_LIBCPP_HAS_THREADS=1",
+                "-D_LIBCPP_HAS_MONOTONIC_CLOCK",
             ]
             .into_iter()
             .map(ToString::to_string),
@@ -1031,16 +1425,16 @@ impl Zig {
                         fs::write(arm_features_h, ARM_FEATURES_H)?;
                     }
                 }
-            } else if target.contains("windows-gnu") {
-                if let Ok(lib_dir) = Zig::lib_dir() {
-                    let lib_common = lib_dir.join("libc").join("mingw").join("lib-common");
-                    let synchronization_def = lib_common.join("synchronization.def");
-                    if !synchronization_def.is_file() {
-                        let api_ms_win_core_synch_l1_2_0_def =
-                            lib_common.join("api-ms-win-core-synch-l1-2-0.def");
-                        // Ignore error
-                        fs::copy(api_ms_win_core_synch_l1_2_0_def, synchronization_def).ok();
-                    }
+            } else if target.contains("windows-gnu")
+                && let Ok(lib_dir) = Zig::lib_dir()
+            {
+                let lib_common = lib_dir.join("libc").join("mingw").join("lib-common");
+                let synchronization_def = lib_common.join("synchronization.def");
+                if !synchronization_def.is_file() {
+                    let api_ms_win_core_synch_l1_2_0_def =
+                        lib_common.join("api-ms-win-core-synch-l1-2-0.def");
+                    // Ignore error
+                    fs::copy(api_ms_win_core_synch_l1_2_0_def, synchronization_def).ok();
                 }
             }
         }
@@ -1052,7 +1446,10 @@ impl Zig {
         zig_wrapper: &ZigWrapper,
         enable_zig_ar: bool,
     ) -> Result<PathBuf> {
-        let cmake = cache_dir().join("cmake");
+        // Place cmake toolchain files alongside the other wrappers in the
+        // per-exe directory to avoid races between parallel builds.
+        let wrapper_dir = zig_wrapper.cc.parent().unwrap();
+        let cmake = wrapper_dir.join("cmake");
         fs::create_dir_all(&cmake)?;
 
         let toolchain_file = cmake.join(format!("{target}-toolchain.cmake"));
@@ -1097,37 +1494,63 @@ set(CMAKE_CXX_LINKER_DEPFILE_SUPPORTED FALSE)"#,
                 zig_wrapper.ar.to_slash_lossy()
             ));
         }
+        // When cross-compiling to Darwin from a non-macOS host, CMake requires
+        // install_name_tool and otool which don't exist on Linux/Windows.
+        // Provide our own install_name_tool implementation via symlink wrapper,
+        // and a no-op script for otool (not needed for builds) if no system otool exists.
+        if system_name == "Darwin" && !cfg!(target_os = "macos") {
+            let exe_ext = if cfg!(windows) { ".exe" } else { "" };
+            let install_name_tool = wrapper_dir.join(format!("install_name_tool{exe_ext}"));
+            symlink_wrapper(&install_name_tool)?;
+            content.push_str(&format!(
+                "\nset(CMAKE_INSTALL_NAME_TOOL {})",
+                install_name_tool.to_slash_lossy()
+            ));
+
+            if which::which("otool").is_err() {
+                let script_ext = if cfg!(windows) { "bat" } else { "sh" };
+                let otool = cmake.join(format!("otool.{script_ext}"));
+                write_noop_script(&otool)?;
+                content.push_str(&format!("\nset(CMAKE_OTOOL {})", otool.to_slash_lossy()));
+            }
+        }
+        // Prevent cmake from searching the host system's include and library paths,
+        // which can conflict with zig's bundled headers (e.g. __COLD in sys/cdefs.h).
+        // See https://github.com/rust-cross/cargo-zigbuild/issues/268
+        content.push_str(
+            r#"
+set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)"#,
+        );
         write_file(&toolchain_file, &content)?;
         Ok(toolchain_file)
     }
 
     #[cfg(target_os = "macos")]
     fn macos_sdk_root() -> Option<PathBuf> {
-        match env::var_os("SDKROOT") {
-            Some(sdkroot) => {
-                if !sdkroot.is_empty() {
-                    Some(sdkroot.into())
-                } else {
-                    None
-                }
-            }
-            None => {
-                let output = Command::new("xcrun")
-                    .args(["--sdk", "macosx", "--show-sdk-path"])
-                    .output();
-                if let Ok(output) = output {
+        static SDK_ROOT: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+        SDK_ROOT
+            .get_or_init(|| match env::var_os("SDKROOT") {
+                Some(sdkroot) if !sdkroot.is_empty() => Some(sdkroot.into()),
+                _ => {
+                    let output = Command::new("xcrun")
+                        .args(["--sdk", "macosx", "--show-sdk-path"])
+                        .output()
+                        .ok()?;
                     if output.status.success() {
-                        if let Ok(stdout) = String::from_utf8(output.stdout) {
-                            let stdout = stdout.trim();
-                            if !stdout.is_empty() {
-                                return Some(stdout.into());
-                            }
+                        let stdout = String::from_utf8(output.stdout).ok()?;
+                        let stdout = stdout.trim();
+                        if !stdout.is_empty() {
+                            return Some(stdout.into());
                         }
                     }
+                    None
                 }
-                None
-            }
-        }
+            })
+            .clone()
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -1142,6 +1565,35 @@ set(CMAKE_CXX_LINKER_DEPFILE_SUPPORTED FALSE)"#,
 fn write_file(path: &Path, content: &str) -> Result<(), anyhow::Error> {
     let existing_content = fs::read_to_string(path).unwrap_or_default();
     if existing_content != content {
+        fs::write(path, content)?;
+    }
+    Ok(())
+}
+
+/// Write a no-op shell/batch script for use as a placeholder tool.
+/// Used for macOS-specific tools (install_name_tool, otool) when cross-compiling
+/// to Darwin from non-macOS hosts.
+#[cfg(target_family = "unix")]
+fn write_noop_script(path: &Path) -> Result<()> {
+    let content = "#!/bin/sh\nexit 0\n";
+    let existing = fs::read_to_string(path).unwrap_or_default();
+    if existing != content {
+        OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o700)
+            .open(path)?
+            .write_all(content.as_bytes())?;
+    }
+    Ok(())
+}
+
+#[cfg(not(target_family = "unix"))]
+fn write_noop_script(path: &Path) -> Result<()> {
+    let content = "@echo off\r\nexit /b 0\r\n";
+    let existing = fs::read_to_string(path).unwrap_or_default();
+    if existing != content {
         fs::write(path, content)?;
     }
     Ok(())
@@ -1226,23 +1678,28 @@ impl TargetFlags {
 /// We create different files for different args because otherwise cargo might skip recompiling even
 /// if the linker target changed
 #[allow(clippy::blocks_in_conditions)]
-pub fn prepare_zig_linker(target: &str) -> Result<ZigWrapper> {
-    let (rust_target, _) = target.split_once('.').unwrap_or((target, ""));
-    let triple: Triple = rust_target
-        .parse()
-        .with_context(|| format!("Unsupported Rust target '{rust_target}'"))?;
+pub fn prepare_zig_linker(
+    target: &str,
+    cargo_config: &cargo_config2::Config,
+) -> Result<ZigWrapper> {
+    let (rust_target, abi_suffix) = target.split_once('.').unwrap_or((target, ""));
 
     // For macOS targets, check if we should use clang instead of zig
-    // This works around Zig 0.14+ bug with --sysroot prepending to -L paths
-    if matches!(
-        triple.operating_system,
-        OperatingSystem::MacOSX { .. } | OperatingSystem::Darwin(_)
-    ) && should_use_clang_for_macos()
-    {
-        return prepare_clang_linker(target);
+    // This works around the Zig 0.14 bug where `--sysroot` is prepended to all
+    // -L paths, breaking build script outputs.
+    // See https://github.com/ziglang/zig/issues/24368
+    if should_use_clang_for_macos() {
+        let triple: Triple = rust_target
+            .parse()
+            .with_context(|| format!("Unsupported Rust target '{rust_target}'"))?;
+        if matches!(
+            triple.operating_system,
+            OperatingSystem::MacOSX { .. } | OperatingSystem::Darwin(_)
+        ) {
+            return prepare_clang_linker(target);
+        }
     }
 
-    let (_, abi_suffix) = target.split_once('.').unwrap_or((target, ""));
     let abi_suffix = if abi_suffix.is_empty() {
         String::new()
     } else {
@@ -1266,6 +1723,7 @@ pub fn prepare_zig_linker(target: &str) -> Result<ZigWrapper> {
     let arch = triple.architecture.to_string();
     let target_env = match (triple.architecture, triple.environment) {
         (Architecture::Mips32(..), Environment::Gnu) => Environment::Gnueabihf,
+        (Architecture::Mips32(..), Environment::Musl) => Environment::Musleabi,
         (Architecture::Powerpc, Environment::Gnu) => Environment::Gnueabihf,
         (_, Environment::GnuLlvm) => Environment::Gnu,
         (_, environment) => environment,
@@ -1303,7 +1761,9 @@ pub fn prepare_zig_linker(target: &str) -> Result<ZigWrapper> {
                     }
                 }
                 // RVA23U64 MANDATORY extensions only
-                "riscv64gc" => "generic_rv64+m+a+f+d+c+v+zicsr+zifencei+zicntr+zihpm+ziccif+ziccamoa+zicclsm+ziccrse+za64rs+zihintpause+zic64b+zicbom+zicbop+zicboz+zba+zbb+zbs+zfhmin+zkt+zvfhmin+zvbb+zvkt+zihintntl+zicond+zimop+zcmop+zcb+zfa+zawrs+supm",
+                "riscv64gc" => {
+                    "generic_rv64+m+a+f+d+c+v+zicsr+zifencei+zicntr+zihpm+ziccif+ziccamoa+zicclsm+ziccrse+za64rs+zihintpause+zic64b+zicbom+zicbop+zicboz+zba+zbb+zbs+zfhmin+zkt+zvfhmin+zvbb+zvkt+zihintntl+zicond+zimop+zcmop+zcb+zfa+zawrs+supm"
+                }
                 "s390x" => "z10-vector",
                 _ => "",
             }
@@ -1315,7 +1775,6 @@ pub fn prepare_zig_linker(target: &str) -> Result<ZigWrapper> {
     // commands like `cargo-zigbuild build` are invoked.
     // Currently we only override according to target_cpu.
     let zig_mcpu_override = {
-        let cargo_config = cargo_config2::Config::load()?;
         let rust_flags = cargo_config.rustflags(rust_target)?.unwrap_or_default();
         let encoded_rust_flags = rust_flags.encode()?;
         let target_flags = TargetFlags::parse_from_encoded(OsStr::new(&encoded_rust_flags))?;
@@ -1349,19 +1808,40 @@ pub fn prepare_zig_linker(target: &str) -> Result<ZigWrapper> {
                 "s390x" => "s390x",
                 _ => arch.as_str(),
             };
-            cc_args.push(format!("-target {zig_arch}-linux-{target_env}{abi_suffix}"));
+            let mut zig_target_env = target_env.to_string();
+
+            let zig_version = Zig::zig_version()?;
+
+            // Since Zig 0.15.0, arm-linux-ohos changed to arm-linux-ohoseabi
+            // We need to follow the change but target_lexicon follow the LLVM target(https://github.com/bytecodealliance/target-lexicon/pull/123).
+            // So we use string directly.
+            if zig_version >= semver::Version::new(0, 15, 0)
+                && arch.as_str() == "armv7"
+                && target_env == Environment::Ohos
+            {
+                zig_target_env = "ohoseabi".to_string();
+            }
+
+            cc_args.push("-target".to_string());
+            cc_args.push(format!("{zig_arch}-linux-{zig_target_env}{abi_suffix}"));
         }
         OperatingSystem::MacOSX { .. } | OperatingSystem::Darwin(_) => {
             let zig_version = Zig::zig_version()?;
             // Zig 0.10.0 switched macOS ABI to none
             // see https://github.com/ziglang/zig/pull/11684
+            // The macOS version is an OS version, not an ABI version, so it must
+            // attach to the OS component (`aarch64-macos.11.0-none`). Emitting it
+            // after the ABI (`aarch64-macos-none.11.0`) is rejected by zig with
+            // `InvalidAbiVersion` on every version tested (0.13 through 0.16).
             if zig_version > semver::Version::new(0, 9, 1) {
-                cc_args.push(format!("-target {arch}-macos-none{abi_suffix}"));
+                cc_args.push("-target".to_string());
+                cc_args.push(format!("{arch}-macos{abi_suffix}-none"));
             } else {
-                cc_args.push(format!("-target {arch}-macos-gnu{abi_suffix}"));
+                cc_args.push("-target".to_string());
+                cc_args.push(format!("{arch}-macos{abi_suffix}-gnu"));
             }
         }
-        OperatingSystem::Windows { .. } => {
+        OperatingSystem::Windows => {
             let zig_arch = match arch.as_str() {
                 "i686" => {
                     let zig_version = Zig::zig_version()?;
@@ -1373,18 +1853,26 @@ pub fn prepare_zig_linker(target: &str) -> Result<ZigWrapper> {
                 }
                 arch => arch,
             };
-            cc_args.push(format!(
-                "-target {zig_arch}-windows-{target_env}{abi_suffix}"
-            ));
+            cc_args.push("-target".to_string());
+            cc_args.push(format!("{zig_arch}-windows-{target_env}{abi_suffix}"));
         }
         OperatingSystem::Emscripten => {
-            cc_args.push(format!("-target {arch}-emscripten{abi_suffix}"));
+            cc_args.push("-target".to_string());
+            cc_args.push(format!("{arch}-emscripten{abi_suffix}"));
         }
         OperatingSystem::Wasi => {
-            cc_args.push(format!("-target {arch}-wasi{abi_suffix}"));
+            cc_args.push("-target".to_string());
+            cc_args.push(format!("{arch}-wasi{abi_suffix}"));
         }
         OperatingSystem::WasiP1 => {
-            cc_args.push(format!("-target {arch}-wasi.0.1.0{abi_suffix}"));
+            cc_args.push("-target".to_string());
+            cc_args.push(format!("{arch}-wasi.0.1.0{abi_suffix}"));
+        }
+        OperatingSystem::IOS(_) if triple.environment == Environment::Macabi => {
+            // Mac Catalyst (aarch64-apple-ios-macabi / x86_64-apple-ios-macabi)
+            // maps to zig's maccatalyst target
+            cc_args.push("-target".to_string());
+            cc_args.push(format!("{arch}-maccatalyst-none{abi_suffix}"));
         }
         OperatingSystem::Freebsd => {
             let zig_arch = match arch.as_str() {
@@ -1398,13 +1886,19 @@ pub fn prepare_zig_linker(target: &str) -> Result<ZigWrapper> {
                 }
                 arch => arch,
             };
-            cc_args.push(format!("-target {zig_arch}-freebsd"));
+            cc_args.push("-target".to_string());
+            cc_args.push(format!("{zig_arch}-freebsd"));
+        }
+        OperatingSystem::Openbsd => {
+            cc_args.push("-target".to_string());
+            cc_args.push(format!("{arch}-openbsd"));
         }
         OperatingSystem::Unknown => {
             if triple.architecture == Architecture::Wasm32
                 || triple.architecture == Architecture::Wasm64
             {
-                cc_args.push(format!("-target {arch}-freestanding{abi_suffix}"));
+                cc_args.push("-target".to_string());
+                cc_args.push(format!("{arch}-freestanding{abi_suffix}"));
             } else {
                 bail!("unsupported target '{rust_target}'")
             }
@@ -1452,7 +1946,8 @@ pub fn prepare_zig_linker(target: &str) -> Result<ZigWrapper> {
                     }
 
                     cc_args.push(format!("-Wl,--version-script={}", fcntl_map.display()));
-                    cc_args.push(format!("-include {}", fcntl_h.display()));
+                    cc_args.push("-include".to_string());
+                    cc_args.push(fcntl_h.display().to_string());
                 }
             }
         } else if matches!(
@@ -1482,20 +1977,53 @@ pub fn prepare_zig_linker(target: &str) -> Result<ZigWrapper> {
         }
     }
 
-    let cc_args_str = cc_args.join(" ");
+    // Use platform-specific quoting: shell_words for Unix (single quotes),
+    // custom quoting for Windows batch files (double quotes)
+    let cc_args_str = join_args_for_script(&cc_args);
+
+    // Put all generated wrappers and symlinks in a per-exe subdirectory so
+    // that parallel builds driven by different binaries (e.g. multiple maturin
+    // instances in separate temp venvs) never clobber each other.
+    // See https://github.com/rust-cross/cargo-zigbuild/issues/318
+    let current_exe = resolve_current_exe()?;
+    let exe_hash = crc::Crc::<u16>::new(&crc::CRC_16_IBM_SDLC)
+        .checksum(current_exe.as_os_str().as_encoded_bytes());
+    let wrapper_dir = zig_linker_dir
+        .join("wrappers")
+        .join(format!("{:x}", exe_hash));
+    fs::create_dir_all(&wrapper_dir)?;
+
     let hash = crc::Crc::<u16>::new(&crc::CRC_16_IBM_SDLC).checksum(cc_args_str.as_bytes());
-    let zig_cc = zig_linker_dir.join(format!("zigcc-{file_target}-{:x}.{file_ext}", hash));
-    let zig_cxx = zig_linker_dir.join(format!("zigcxx-{file_target}-{:x}.{file_ext}", hash));
-    let zig_ranlib = zig_linker_dir.join(format!("zigranlib.{file_ext}"));
-    write_linker_wrapper(&zig_cc, "cc", &cc_args_str)?;
-    write_linker_wrapper(&zig_cxx, "c++", &cc_args_str)?;
-    write_linker_wrapper(&zig_ranlib, "ranlib", "")?;
+    let zig_cc = wrapper_dir.join(format!("zigcc-{file_target}-{:x}.{file_ext}", hash));
+    let zig_cxx = wrapper_dir.join(format!("zigcxx-{file_target}-{:x}.{file_ext}", hash));
+    let zig_ranlib = wrapper_dir.join(format!("zigranlib.{file_ext}"));
+    let zig_version = Zig::zig_version()?;
+    write_linker_wrapper(&zig_cc, "cc", &cc_args_str, &zig_version)?;
+    write_linker_wrapper(&zig_cxx, "c++", &cc_args_str, &zig_version)?;
+    write_linker_wrapper(&zig_ranlib, "ranlib", "", &zig_version)?;
 
     let exe_ext = if cfg!(windows) { ".exe" } else { "" };
-    let zig_ar = zig_linker_dir.join(format!("ar{exe_ext}"));
+    let zig_ar = wrapper_dir.join(format!("ar{exe_ext}"));
     symlink_wrapper(&zig_ar)?;
-    let zig_lib = zig_linker_dir.join(format!("lib{exe_ext}"));
+    let zig_lib = wrapper_dir.join(format!("lib{exe_ext}"));
     symlink_wrapper(&zig_lib)?;
+
+    // Create dlltool symlinks for Windows GNU targets, but only if no system dlltool exists
+    // On Windows hosts, rustc looks for "dlltool.exe"
+    // On non-Windows hosts, rustc looks for architecture-specific names
+    //
+    // See https://github.com/rust-lang/rust/blob/a18e6d9d1473d9b25581dd04bef6c7577999631c/compiler/rustc_codegen_ssa/src/back/archive.rs#L275-L309
+    if matches!(triple.operating_system, OperatingSystem::Windows)
+        && matches!(triple.environment, Environment::Gnu)
+    {
+        // Only create zig dlltool wrapper if no system dlltool is found
+        // System dlltool (from mingw-w64) handles raw-dylib better than zig's dlltool
+        if !has_system_dlltool(&triple.architecture) {
+            let dlltool_name = get_dlltool_name(&triple.architecture);
+            let zig_dlltool = wrapper_dir.join(format!("{dlltool_name}{exe_ext}"));
+            symlink_wrapper(&zig_dlltool)?;
+        }
+    }
 
     Ok(ZigWrapper {
         cc: zig_cc,
@@ -1506,12 +2034,17 @@ pub fn prepare_zig_linker(target: &str) -> Result<ZigWrapper> {
     })
 }
 
-fn symlink_wrapper(target: &Path) -> Result<()> {
-    let current_exe = if let Ok(exe) = env::var("CARGO_BIN_EXE_cargo-zigbuild") {
-        PathBuf::from(exe)
+/// Resolve the current executable path, preferring the test override env var.
+fn resolve_current_exe() -> Result<PathBuf> {
+    if let Ok(exe) = env::var("CARGO_BIN_EXE_cargo-zigbuild") {
+        Ok(PathBuf::from(exe))
     } else {
-        env::current_exe()?
-    };
+        Ok(env::current_exe()?)
+    }
+}
+
+fn symlink_wrapper(target: &Path) -> Result<()> {
+    let current_exe = resolve_current_exe()?;
     #[cfg(windows)]
     {
         if !target.exists() {
@@ -1536,16 +2069,83 @@ fn symlink_wrapper(target: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Join arguments for Unix shell script using shell_words (single quotes)
+#[cfg(target_family = "unix")]
+fn join_args_for_script<I, S>(args: I) -> String
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    shell_words::join(args)
+}
+
+/// Quote a string for Windows batch file (cmd.exe)
+///
+/// - `%` expands even inside quotes, so we escape it as `%%`.
+/// - We disable delayed expansion in the wrapper script, so `!` should not expand.
+/// - Internal `"` are escaped by doubling them (`""`).
+#[cfg(not(target_family = "unix"))]
+fn quote_for_batch(s: &str) -> String {
+    let needs_quoting_or_escaping = s.is_empty()
+        || s.contains(|c: char| {
+            matches!(
+                c,
+                ' ' | '\t' | '"' | '&' | '|' | '<' | '>' | '^' | '%' | '(' | ')' | '!'
+            )
+        });
+
+    if !needs_quoting_or_escaping {
+        return s.to_string();
+    }
+
+    let mut out = String::with_capacity(s.len() + 8);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\"\""),
+            '%' => out.push_str("%%"),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Join arguments for Windows batch file using double quotes
+#[cfg(not(target_family = "unix"))]
+fn join_args_for_script<I, S>(args: I) -> String
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    args.into_iter()
+        .map(|s| quote_for_batch(s.as_ref()))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Write a zig cc wrapper batch script for unix
 #[cfg(target_family = "unix")]
-fn write_linker_wrapper(path: &Path, command: &str, args: &str) -> Result<()> {
+fn write_linker_wrapper(
+    path: &Path,
+    command: &str,
+    args: &str,
+    zig_version: &semver::Version,
+) -> Result<()> {
     let mut buf = Vec::<u8>::new();
-    let current_exe = if let Ok(exe) = env::var("CARGO_BIN_EXE_cargo-zigbuild") {
-        PathBuf::from(exe)
-    } else {
-        env::current_exe()?
-    };
+    let current_exe = resolve_current_exe()?;
     writeln!(&mut buf, "#!/bin/sh")?;
+
+    // Export zig version to avoid spawning `zig version` subprocess
+    writeln!(
+        &mut buf,
+        "export CARGO_ZIGBUILD_ZIG_VERSION={}",
+        zig_version
+    )?;
+
+    // Pass through SDKROOT if it exists at runtime
+    writeln!(&mut buf, "if [ -n \"$SDKROOT\" ]; then export SDKROOT; fi")?;
+
     writeln!(
         &mut buf,
         "exec \"{}\" zig {} -- {} \"$@\"",
@@ -1572,18 +2172,24 @@ fn write_linker_wrapper(path: &Path, command: &str, args: &str) -> Result<()> {
 
 /// Write a zig cc wrapper batch script for windows
 #[cfg(not(target_family = "unix"))]
-fn write_linker_wrapper(path: &Path, command: &str, args: &str) -> Result<()> {
+fn write_linker_wrapper(
+    path: &Path,
+    command: &str,
+    args: &str,
+    zig_version: &semver::Version,
+) -> Result<()> {
     let mut buf = Vec::<u8>::new();
-    let current_exe = if let Ok(exe) = env::var("CARGO_BIN_EXE_cargo-zigbuild") {
-        PathBuf::from(exe)
-    } else {
-        env::current_exe()?
-    };
+    let current_exe = resolve_current_exe()?;
     let current_exe = if is_mingw_shell() {
         current_exe.to_slash_lossy().to_string()
     } else {
         current_exe.display().to_string()
     };
+    writeln!(&mut buf, "@echo off")?;
+    // Prevent `!VAR!` expansion surprises (delayed expansion) in user-controlled args.
+    writeln!(&mut buf, "setlocal DisableDelayedExpansion")?;
+    // Set zig version to avoid spawning `zig version` subprocess
+    writeln!(&mut buf, "set CARGO_ZIGBUILD_ZIG_VERSION={}", zig_version)?;
     writeln!(
         &mut buf,
         "\"{}\" zig {} -- {} %*",
@@ -1625,7 +2231,7 @@ fn zig_path() -> Result<PathBuf> {
 }
 
 /// Prepare clang-based linker wrapper for macOS cross-compilation.
-/// This is used as a fallback when Zig 0.14+ has issues with --sysroot.
+/// This is used as a fallback when Zig 0.14 has issues with --sysroot.
 pub fn prepare_clang_linker(target: &str) -> Result<ZigWrapper> {
     let (rust_target, abi_suffix) = target.split_once('.').unwrap_or((target, ""));
     let triple: Triple = rust_target
@@ -1750,6 +2356,28 @@ fn write_clang_wrapper(path: &Path, compiler: &Path, args: &str) -> Result<()> {
     Ok(())
 }
 
+/// Get the dlltool executable name for the given architecture
+/// On Windows, rustc looks for "dlltool.exe"
+/// On non-Windows hosts, rustc looks for architecture-specific names
+fn get_dlltool_name(arch: &Architecture) -> &'static str {
+    if cfg!(windows) {
+        "dlltool"
+    } else {
+        match arch {
+            Architecture::X86_64 => "x86_64-w64-mingw32-dlltool",
+            Architecture::X86_32(_) => "i686-w64-mingw32-dlltool",
+            Architecture::Aarch64(_) => "aarch64-w64-mingw32-dlltool",
+            _ => "dlltool",
+        }
+    }
+}
+
+/// Check if a dlltool for the given architecture exists in PATH
+/// Returns true if found, false otherwise
+fn has_system_dlltool(arch: &Architecture) -> bool {
+    which::which(get_dlltool_name(arch)).is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1791,5 +2419,418 @@ mod tests {
             assert_eq!(flags.target_cpu, *expected_target_cpu, "{}", input);
             assert_eq!(flags.target_feature, *expected_target_feature, "{}", input);
         }
+    }
+
+    #[test]
+    fn test_join_args_for_script() {
+        // Test basic arguments without special characters
+        let args = vec!["-target", "x86_64-linux-gnu"];
+        let result = join_args_for_script(&args);
+        assert!(result.contains("-target"));
+        assert!(result.contains("x86_64-linux-gnu"));
+    }
+
+    #[test]
+    #[cfg(not(target_family = "unix"))]
+    fn test_quote_for_batch() {
+        // Simple argument without special characters - no quoting needed
+        assert_eq!(quote_for_batch("-target"), "-target");
+        assert_eq!(quote_for_batch("x86_64-linux-gnu"), "x86_64-linux-gnu");
+
+        // Arguments with spaces need quoting
+        assert_eq!(
+            quote_for_batch("C:\\Users\\John Doe\\path"),
+            "\"C:\\Users\\John Doe\\path\""
+        );
+
+        // Empty string needs quoting
+        assert_eq!(quote_for_batch(""), "\"\"");
+
+        // Arguments with special batch characters need quoting
+        assert_eq!(quote_for_batch("foo&bar"), "\"foo&bar\"");
+        assert_eq!(quote_for_batch("foo|bar"), "\"foo|bar\"");
+        assert_eq!(quote_for_batch("foo<bar"), "\"foo<bar\"");
+        assert_eq!(quote_for_batch("foo>bar"), "\"foo>bar\"");
+        assert_eq!(quote_for_batch("foo^bar"), "\"foo^bar\"");
+        assert_eq!(quote_for_batch("foo%bar"), "\"foo%bar\"");
+
+        // Internal double quotes are escaped by doubling
+        assert_eq!(quote_for_batch("foo\"bar"), "\"foo\"\"bar\"");
+    }
+
+    #[test]
+    #[cfg(not(target_family = "unix"))]
+    fn test_join_args_for_script_windows() {
+        // Test with path containing spaces
+        let args = vec![
+            "-target",
+            "x86_64-linux-gnu",
+            "-L",
+            "C:\\Users\\John Doe\\path",
+        ];
+        let result = join_args_for_script(&args);
+        // The path with space should be quoted
+        assert!(result.contains("\"C:\\Users\\John Doe\\path\""));
+        // Simple args should not be quoted
+        assert!(result.contains("-target"));
+        assert!(!result.contains("\"-target\""));
+    }
+
+    fn make_rustc_ver(major: u64, minor: u64, patch: u64) -> rustc_version::Version {
+        rustc_version::Version::new(major, minor, patch)
+    }
+
+    fn make_zig_ver(major: u64, minor: u64, patch: u64) -> semver::Version {
+        semver::Version::new(major, minor, patch)
+    }
+
+    fn run_filter(args: &[&str], target: Option<&str>, zig_ver: (u64, u64)) -> Vec<String> {
+        let rustc_ver = make_rustc_ver(1, 80, 0);
+        let zig_version = make_zig_ver(0, zig_ver.0, zig_ver.1);
+        let target_info = TargetInfo::new(target.map(|s| s.to_string()).as_ref());
+        filter_linker_args(
+            args.iter().map(|s| s.to_string()),
+            &rustc_ver,
+            &zig_version,
+            &target_info,
+        )
+    }
+
+    fn run_filter_one(arg: &str, target: Option<&str>, zig_ver: (u64, u64)) -> Vec<String> {
+        run_filter(&[arg], target, zig_ver)
+    }
+
+    fn run_filter_one_rustc(
+        arg: &str,
+        target: Option<&str>,
+        zig_ver: (u64, u64),
+        rustc_minor: u64,
+    ) -> Vec<String> {
+        let rustc_ver = make_rustc_ver(1, rustc_minor, 0);
+        let zig_version = make_zig_ver(0, zig_ver.0, zig_ver.1);
+        let target_info = TargetInfo::new(target.map(|s| s.to_string()).as_ref());
+        filter_linker_args(
+            std::iter::once(arg.to_string()),
+            &rustc_ver,
+            &zig_version,
+            &target_info,
+        )
+    }
+
+    #[test]
+    fn test_filter_common_replacements() {
+        let linux = Some("x86_64-unknown-linux-gnu");
+        // -lgcc_s -> -lunwind
+        assert_eq!(run_filter_one("-lgcc_s", linux, (13, 0)), vec!["-lunwind"]);
+        // --target= stripped (already passed via -target)
+        assert!(run_filter_one("--target=x86_64-unknown-linux-gnu", linux, (13, 0)).is_empty());
+        // -e<entry> transformed to -Wl,--entry=<entry>
+        assert_eq!(
+            run_filter_one("-emain", linux, (13, 0)),
+            vec!["-Wl,--entry=main"]
+        );
+        // -export-* should NOT be transformed
+        assert_eq!(
+            run_filter_one("-export-dynamic", linux, (13, 0)),
+            vec!["-export-dynamic"]
+        );
+    }
+
+    #[test]
+    fn test_filter_compiler_builtins_removed() {
+        for target in &["armv7-unknown-linux-gnueabihf", "x86_64-pc-windows-gnu"] {
+            let result = run_filter_one(
+                "/path/to/libcompiler_builtins-abc123.rlib",
+                Some(target),
+                (13, 0),
+            );
+            assert!(
+                result.is_empty(),
+                "compiler_builtins should be removed for {target}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_filter_windows_gnu_args() {
+        let gnu = Some("x86_64-pc-windows-gnu");
+        // Args that should be removed entirely
+        let removed: &[&str] = &[
+            "-lwindows",
+            "-l:libpthread.a",
+            "-lgcc",
+            "-Wl,--disable-auto-image-base",
+            "-Wl,--dynamicbase",
+            "-Wl,--large-address-aware",
+            "-Wl,/path/to/list.def",
+            "-Wl,C:\\path\\to\\list.def",
+            "-lmsvcrt",
+        ];
+        for arg in removed {
+            let result = run_filter_one(arg, gnu, (13, 0));
+            assert!(result.is_empty(), "{arg} should be removed for windows-gnu");
+        }
+        // Args that get replaced
+        let replaced: &[(&str, (u64, u64), &str)] = &[
+            ("-lgcc_eh", (13, 0), "-lc++"),
+            ("-Wl,-Bdynamic", (13, 0), "-Wl,-search_paths_first"),
+        ];
+        for (arg, zig_ver, expected) in replaced {
+            let result = run_filter_one(arg, gnu, *zig_ver);
+            assert_eq!(result, vec![*expected], "filter({arg})");
+        }
+        // -lgcc_eh kept on zig >= 0.14 for x86_64
+        let result = run_filter_one("-lgcc_eh", gnu, (14, 0));
+        assert_eq!(result, vec!["-lgcc_eh"]);
+    }
+
+    #[test]
+    fn test_filter_windows_gnu_rsbegin() {
+        // i686: rsbegin.o filtered out
+        let result = run_filter_one("/path/to/rsbegin.o", Some("i686-pc-windows-gnu"), (13, 0));
+        assert!(result.is_empty());
+        // x86_64: rsbegin.o kept
+        let result = run_filter_one("/path/to/rsbegin.o", Some("x86_64-pc-windows-gnu"), (13, 0));
+        assert_eq!(result, vec!["/path/to/rsbegin.o"]);
+    }
+
+    #[test]
+    fn test_filter_unsupported_linker_args() {
+        let linux = Some("x86_64-unknown-linux-gnu");
+        let removed: &[&str] = &[
+            "-Wl,--no-undefined-version",
+            "-Wl,-znostart-stop-gc",
+            "-Wl,--fix-cortex-a53-843419",
+            "-Wl,-plugin-opt=O2",
+        ];
+        for arg in removed {
+            let result = run_filter_one(arg, linux, (13, 0));
+            assert!(result.is_empty(), "{arg} should be removed");
+        }
+    }
+
+    #[test]
+    fn test_filter_wp_args() {
+        let linux = Some("x86_64-unknown-linux-gnu");
+        // Unsupported -Wp, args should be removed
+        for arg in &[
+            "-Wp,-U_FORTIFY_SOURCE",
+            "-Wp,-DFOO=1",
+            "-Wp,-MF,/tmp/t.d",
+            "-Wp,-MQ,foo",
+            "-Wp,-MP",
+        ] {
+            let result = run_filter_one(arg, linux, (13, 0));
+            assert!(result.is_empty(), "{arg} should be removed");
+        }
+        // Supported -Wp, args should be kept (-MD, -MMD, -MT)
+        for arg in &["-Wp,-MD,/tmp/test.d", "-Wp,-MMD,/tmp/test.d", "-Wp,-MT,foo"] {
+            let result = run_filter_one(arg, linux, (13, 0));
+            assert_eq!(result, vec![*arg], "{arg} should be kept");
+        }
+        // bare -U and -D should be kept (zig cc supports them directly)
+        let result = run_filter_one("-U_FORTIFY_SOURCE", linux, (13, 0));
+        assert_eq!(result, vec!["-U_FORTIFY_SOURCE"]);
+        let result = run_filter_one("-DFOO=1", linux, (13, 0));
+        assert_eq!(result, vec!["-DFOO=1"]);
+    }
+
+    #[test]
+    fn test_filter_musl_args() {
+        let musl = Some("x86_64-unknown-linux-musl");
+        let removed: &[&str] = &["/path/self-contained/crt1.o", "-lc"];
+        for arg in removed {
+            let result = run_filter_one(arg, musl, (13, 0));
+            assert!(result.is_empty(), "{arg} should be removed for musl");
+        }
+        // -Wl,-melf_i386 for i686 musl
+        let result = run_filter_one("-Wl,-melf_i386", Some("i686-unknown-linux-musl"), (13, 0));
+        assert!(result.is_empty());
+        // liblibc removed for old rustc (<1.59), kept for new
+        let result = run_filter_one_rustc("/path/to/liblibc-abc123.rlib", musl, (13, 0), 58);
+        assert!(result.is_empty());
+        let result = run_filter_one_rustc("/path/to/liblibc-abc123.rlib", musl, (13, 0), 59);
+        assert_eq!(result, vec!["/path/to/liblibc-abc123.rlib"]);
+    }
+
+    #[test]
+    fn test_filter_march_args() {
+        // (input, target, expected)
+        let cases: &[(&str, &str, &[&str])] = &[
+            // arm: removed
+            ("-march=armv7-a", "armv7-unknown-linux-gnueabihf", &[]),
+            // riscv64: replaced
+            (
+                "-march=rv64gc",
+                "riscv64gc-unknown-linux-gnu",
+                &["-march=generic_rv64"],
+            ),
+            // riscv32: replaced
+            (
+                "-march=rv32imac",
+                "riscv32imac-unknown-none-elf",
+                &["-march=generic_rv32"],
+            ),
+            // aarch64 armv: converted to -mcpu=generic
+            (
+                "-march=armv8.4-a",
+                "aarch64-unknown-linux-gnu",
+                &["-mcpu=generic"],
+            ),
+            // aarch64 armv with crypto: adds -Xassembler
+            (
+                "-march=armv8.4-a+crypto",
+                "aarch64-unknown-linux-gnu",
+                &[
+                    "-mcpu=generic+crypto",
+                    "-Xassembler",
+                    "-march=armv8.4-a+crypto",
+                ],
+            ),
+            // apple aarch64: uses apple cpu name
+            (
+                "-march=armv8.4-a",
+                "aarch64-apple-darwin",
+                &["-mcpu=apple_m1"],
+            ),
+        ];
+        for (input, target, expected) in cases {
+            let result = run_filter_one(input, Some(target), (13, 0));
+            assert_eq!(&result, expected, "filter({input}, {target})");
+        }
+    }
+
+    #[test]
+    fn test_filter_apple_args() {
+        let darwin = Some("aarch64-apple-darwin");
+        let result = run_filter_one("-Wl,-dylib", darwin, (13, 0));
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_filter_freebsd_libs_removed() {
+        for lib in &["-lkvm", "-lmemstat", "-lprocstat", "-ldevstat"] {
+            let result = run_filter_one(lib, Some("x86_64-unknown-freebsd"), (13, 0));
+            assert!(result.is_empty(), "{lib} should be removed for freebsd");
+        }
+    }
+
+    #[test]
+    fn test_filter_exported_symbols_list_two_arg_apple() {
+        let result = run_filter(
+            &[
+                "-arch",
+                "arm64",
+                "-Wl,-exported_symbols_list",
+                "-Wl,/tmp/rustcXXX/list",
+                "-o",
+                "output.dylib",
+            ],
+            Some("aarch64-apple-darwin"),
+            (13, 0),
+        );
+        assert_eq!(result, vec!["-arch", "arm64", "-o", "output.dylib"]);
+    }
+
+    #[test]
+    fn test_filter_exported_symbols_list_two_arg_cross_platform() {
+        let result = run_filter(
+            &[
+                "-arch",
+                "arm64",
+                "-Wl,-exported_symbols_list",
+                "-Wl,C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\rustcXXX\\list",
+                "-o",
+                "output.dylib",
+            ],
+            None,
+            (13, 0),
+        );
+        assert_eq!(result, vec!["-arch", "arm64", "-o", "output.dylib"]);
+    }
+
+    #[test]
+    fn test_filter_exported_symbols_list_single_arg_comma() {
+        let result = run_filter(
+            &[
+                "-Wl,-exported_symbols_list,/tmp/rustcXXX/list",
+                "-o",
+                "output.dylib",
+            ],
+            Some("aarch64-apple-darwin"),
+            (13, 0),
+        );
+        assert_eq!(result, vec!["-o", "output.dylib"]);
+    }
+
+    #[test]
+    fn test_filter_exported_symbols_list_not_filtered_zig_016() {
+        let result = run_filter(
+            &[
+                "-Wl,-exported_symbols_list",
+                "-Wl,/tmp/rustcXXX/list",
+                "-o",
+                "output.dylib",
+            ],
+            Some("aarch64-apple-darwin"),
+            (16, 0),
+        );
+        assert_eq!(
+            result,
+            vec![
+                "-Wl,-exported_symbols_list",
+                "-Wl,/tmp/rustcXXX/list",
+                "-o",
+                "output.dylib"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_filter_dynamic_list_two_arg() {
+        let result = run_filter(
+            &[
+                "-Wl,--dynamic-list",
+                "-Wl,/tmp/rustcXXX/list",
+                "-o",
+                "output.so",
+            ],
+            Some("x86_64-unknown-linux-gnu"),
+            (13, 0),
+        );
+        assert_eq!(result, vec!["-o", "output.so"]);
+    }
+
+    #[test]
+    fn test_filter_dynamic_list_single_arg_comma() {
+        let result = run_filter(
+            &["-Wl,--dynamic-list,/tmp/rustcXXX/list", "-o", "output.so"],
+            Some("x86_64-unknown-linux-gnu"),
+            (13, 0),
+        );
+        assert_eq!(result, vec!["-o", "output.so"]);
+    }
+
+    #[test]
+    fn test_filter_preserves_normal_args() {
+        let result = run_filter(
+            &["-arch", "arm64", "-lSystem", "-lc", "-o", "output"],
+            Some("aarch64-apple-darwin"),
+            (13, 0),
+        );
+        assert_eq!(
+            result,
+            vec!["-arch", "arm64", "-lSystem", "-lc", "-o", "output"]
+        );
+    }
+
+    #[test]
+    fn test_filter_skip_next_at_end_of_args() {
+        let result = run_filter(
+            &["-o", "output", "-Wl,-exported_symbols_list"],
+            Some("aarch64-apple-darwin"),
+            (13, 0),
+        );
+        assert_eq!(result, vec!["-o", "output"]);
     }
 }

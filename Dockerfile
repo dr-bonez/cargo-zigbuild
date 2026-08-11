@@ -1,5 +1,5 @@
 ARG PREV_ZIGBUILD_IMG=start9/cargo-zigbuild
-ARG RUST_VERSION=1.91.1
+ARG RUST_VERSION=1.97.1
 ARG BUILDPLATFORM
 
 FROM --platform=$BUILDPLATFORM $PREV_ZIGBUILD_IMG AS builder
@@ -62,18 +62,30 @@ RUN apk add fuse3 fuse3-dev fuse3-static musl-dev pkgconfig
 FROM rust:$RUST_VERSION-trixie
 
 # Install Zig
-ARG ZIG_VERSION=0.15.2
-RUN curl -L "https://ziglang.org/download/${ZIG_VERSION}/zig-$(uname -m)-linux-${ZIG_VERSION}.tar.xz" | tar -J -x -C /usr/local && \
-    ln -s "/usr/local/zig-$(uname -m)-linux-${ZIG_VERSION}/zig" /usr/local/bin/zig
+ARG ZIG_VERSION=0.16.0
+# Zig 0.14.0+ changed the tarball naming convention: zig-{arch}-{os}-{version} instead of zig-{os}-{arch}-{version}
+# We detect the version and construct the appropriate URL and directory path
+RUN \
+    ARCH=$(uname -m) && \
+    MAJOR=$(echo "$ZIG_VERSION" | cut -d. -f1) && \
+    MINOR=$(echo "$ZIG_VERSION" | cut -d. -f2) && \
+    if [ "$MAJOR" -eq 0 ] && [ "$MINOR" -lt 14 ]; then \
+        TARBALL="zig-linux-${ARCH}-${ZIG_VERSION}.tar.xz" && \
+        DIR="zig-linux-${ARCH}-${ZIG_VERSION}"; \
+    else \
+        TARBALL="zig-${ARCH}-linux-${ZIG_VERSION}.tar.xz" && \
+        DIR="zig-${ARCH}-linux-${ZIG_VERSION}"; \
+    fi && \
+    curl -L "https://ziglang.org/download/${ZIG_VERSION}/${TARBALL}" | tar -J -x -C /usr/local && \
+    ln -s "/usr/local/${DIR}/zig" /usr/local/bin/zig
 
 # Install macOS SDKs
-RUN curl -L "https://github.com/phracker/MacOSX-SDKs/releases/download/11.3/MacOSX10.9.sdk.tar.xz" | tar -J -x -C /opt
 RUN curl -L "https://github.com/phracker/MacOSX-SDKs/releases/download/11.3/MacOSX11.3.sdk.tar.xz" | tar -J -x -C /opt
 ENV SDKROOT=/opt/MacOSX11.3.sdk
 
 # Install Rust targets
-RUN rustup default beta \
-    && rustup target add \
+# Uses the stable toolchain pinned by RUST_VERSION from the base image.
+RUN rustup target add \
     x86_64-unknown-linux-gnu \
     x86_64-unknown-linux-musl \
     aarch64-unknown-linux-gnu \
